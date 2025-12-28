@@ -1,0 +1,91 @@
+version: '3.8'
+
+services:
+  # Temporal Server (development mode)
+  temporal:
+    image: temporalio/auto-setup:1.22
+    ports:
+      - "7233:7233"
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "temporal", "workflow", "list", "--namespace", "default"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Temporal UI
+  temporal-ui:
+    image: temporalio/ui:2.21.3
+    ports:
+      - "8088:8080"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    depends_on:
+      - temporal
+
+  # PostgreSQL for Temporal
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=temporal
+      - POSTGRES_PASSWORD=temporal
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # API Server
+  api-server:
+    build:
+      context: .
+      dockerfile: api-server/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - API_PORT=8080
+      - TEMPORAL_HOST=temporal:7233
+    depends_on:
+      temporal:
+        condition: service_healthy
+
+  # Temporal Worker
+  temporal-worker:
+    build:
+      context: .
+      dockerfile: temporal-worker/Dockerfile
+    environment:
+      - TEMPORAL_HOST=temporal:7233
+    depends_on:
+      temporal:
+        condition: service_healthy
+
+  # Frontend
+  frontend:
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - api-server
+
+volumes:
+  postgres_data:
+
+networks:
+  default:
+    name: flight-booking-network
+
