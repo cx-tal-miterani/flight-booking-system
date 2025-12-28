@@ -10,7 +10,14 @@ async function handleResponse<T>(response: Response): Promise<T> {
   return response.json();
 }
 
+export interface CreateOrderRequest {
+  flightId: string;
+  customerEmail: string;
+  customerName: string;
+}
+
 export const api = {
+  // Flights
   getFlights: async (): Promise<Flight[]> => {
     const response = await fetch(`${API_BASE}/flights`);
     return handleResponse<Flight[]>(response);
@@ -26,7 +33,8 @@ export const api = {
     return handleResponse<Seat[]>(response);
   },
 
-  createOrder: async (request: { flightId: string; customerEmail: string; customerName: string }): Promise<Order> => {
+  // Orders
+  createOrder: async (request: CreateOrderRequest): Promise<Order> => {
     const response = await fetch(`${API_BASE}/orders`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -59,7 +67,19 @@ export const api = {
   },
 
   cancelOrder: async (orderId: string): Promise<void> => {
-    await fetch(`${API_BASE}/orders/${orderId}`, { method: 'DELETE' });
+    const response = await fetch(`${API_BASE}/orders/${orderId}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+      throw new Error(error.error || `HTTP ${response.status}`);
+    }
+  },
+
+  refreshTimer: async (orderId: string): Promise<OrderStatusResponse> => {
+    const response = await fetch(`${API_BASE}/orders/${orderId}/refresh`, {
+      method: 'POST',
+    });
+    return handleResponse<OrderStatusResponse>(response);
   },
 };
-

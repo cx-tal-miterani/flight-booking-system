@@ -1,73 +1,150 @@
 import { useState, useRef, useEffect } from 'react';
+import { Loader2, Lock, RefreshCw } from 'lucide-react';
+import { Button } from './ui/button';
+import { Card, CardHeader, CardTitle, CardDescription, CardContent } from './ui/card';
+import { Alert, AlertDescription } from './ui/alert';
 
 interface PaymentFormProps {
   onSubmit: (paymentCode: string) => void;
   loading: boolean;
   attempts: number;
+  maxAttempts?: number;
 }
 
-export function PaymentForm({ onSubmit, loading, attempts }: PaymentFormProps) {
+export function PaymentForm({ onSubmit, loading, attempts, maxAttempts = 3 }: PaymentFormProps) {
   const [digits, setDigits] = useState(['', '', '', '', '']);
   const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
 
-  useEffect(() => { inputRefs.current[0]?.focus(); }, []);
+  useEffect(() => {
+    inputRefs.current[0]?.focus();
+  }, []);
+
+  // Clear digits on retry
+  useEffect(() => {
+    if (attempts > 0) {
+      setDigits(['', '', '', '', '']);
+      inputRefs.current[0]?.focus();
+    }
+  }, [attempts]);
 
   const handleChange = (index: number, value: string) => {
     if (!/^\d*$/.test(value)) return;
+    
     const newDigits = [...digits];
     newDigits[index] = value.slice(-1);
     setDigits(newDigits);
-    if (value && index < 4) inputRefs.current[index + 1]?.focus();
+    
+    if (value && index < 4) {
+      inputRefs.current[index + 1]?.focus();
+    }
   };
 
   const handleKeyDown = (index: number, e: React.KeyboardEvent) => {
-    if (e.key === 'Backspace' && !digits[index] && index > 0) inputRefs.current[index - 1]?.focus();
+    if (e.key === 'Backspace' && !digits[index] && index > 0) {
+      inputRefs.current[index - 1]?.focus();
+    }
+  };
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    e.preventDefault();
+    const pastedData = e.clipboardData.getData('text').replace(/\D/g, '').slice(0, 5);
+    const newDigits = ['', '', '', '', ''];
+    for (let i = 0; i < pastedData.length; i++) {
+      newDigits[i] = pastedData[i];
+    }
+    setDigits(newDigits);
+    inputRefs.current[Math.min(pastedData.length, 4)]?.focus();
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const code = digits.join('');
-    if (code.length === 5) onSubmit(code);
+    if (code.length === 5) {
+      onSubmit(code);
+    }
   };
 
+  const isComplete = digits.every((d) => d !== '');
+  const remainingAttempts = maxAttempts - attempts;
+
   return (
-    <div className="bg-slate-800/50 border border-slate-700/50 rounded-2xl p-8">
-      <h2 className="text-2xl font-semibold text-white mb-2">Payment</h2>
-      <p className="text-slate-400 mb-6">Enter your 5-digit payment code</p>
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Lock className="w-5 h-5 text-cyan-500" />
+          Payment
+        </CardTitle>
+        <CardDescription>
+          Enter your 5-digit payment code to complete the booking
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {attempts > 0 && (
+          <Alert variant="warning" className="mb-6">
+            <AlertDescription>
+              <div className="flex items-center gap-2">
+                <RefreshCw className="w-4 h-4" />
+                Payment attempt {attempts}/{maxAttempts} failed. 
+                {remainingAttempts > 0 
+                  ? ` ${remainingAttempts} attempt${remainingAttempts > 1 ? 's' : ''} remaining.`
+                  : ' This is your last attempt!'
+                }
+              </div>
+            </AlertDescription>
+          </Alert>
+        )}
 
-      {attempts > 0 && (
-        <div className="mb-6 px-4 py-3 rounded-lg bg-amber-500/10 border border-amber-500/30">
-          <p className="text-amber-400 text-sm">Payment attempt {attempts}/3 failed. Please try again.</p>
+        <form onSubmit={handleSubmit}>
+          <div 
+            className="flex justify-center gap-2 sm:gap-3 mb-8" 
+            onPaste={handlePaste}
+          >
+            {digits.map((digit, index) => (
+              <input
+                key={index}
+                ref={(el) => (inputRefs.current[index] = el)}
+                type="text"
+                inputMode="numeric"
+                maxLength={1}
+                value={digit}
+                onChange={(e) => handleChange(index, e.target.value)}
+                onKeyDown={(e) => handleKeyDown(index, e)}
+                disabled={loading}
+                className="w-12 h-14 sm:w-14 sm:h-16 text-center text-xl sm:text-2xl font-mono font-bold bg-slate-700/50 border-2 border-slate-600 rounded-xl text-white focus:border-cyan-500 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 disabled:opacity-50 transition-all"
+                aria-label={`Digit ${index + 1}`}
+              />
+            ))}
+          </div>
+
+          <Button
+            type="submit"
+            variant="success"
+            size="lg"
+            disabled={!isComplete || loading}
+            className="w-full"
+          >
+            {loading ? (
+              <>
+                <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+                Processing Payment...
+              </>
+            ) : (
+              <>
+                <Lock className="w-5 h-5 mr-2" />
+                Pay Now
+              </>
+            )}
+          </Button>
+        </form>
+
+        <div className="mt-6 p-4 bg-slate-800/50 rounded-lg">
+          <p className="text-sm text-slate-400 text-center">
+            <strong>Testing Info:</strong> Use any 5-digit code (e.g., 12345).
+            <br />
+            15% simulated failure rate with up to 3 retry attempts.
+          </p>
         </div>
-      )}
-
-      <form onSubmit={handleSubmit}>
-        <div className="flex justify-center gap-3 mb-8">
-          {digits.map((digit, index) => (
-            <input
-              key={index}
-              ref={(el) => (inputRefs.current[index] = el)}
-              type="text"
-              inputMode="numeric"
-              maxLength={1}
-              value={digit}
-              onChange={(e) => handleChange(index, e.target.value)}
-              onKeyDown={(e) => handleKeyDown(index, e)}
-              className="w-14 h-16 text-center text-2xl font-mono font-bold bg-slate-700 border-2 border-slate-600 rounded-xl text-white focus:border-cyan-500 focus:outline-none"
-            />
-          ))}
-        </div>
-
-        <button type="submit" disabled={digits.some(d => !d) || loading}
-          className="w-full py-4 bg-emerald-500 text-slate-900 font-semibold rounded-xl disabled:opacity-50">
-          {loading ? 'Processing...' : 'Pay Now'}
-        </button>
-      </form>
-
-      <p className="mt-6 text-center text-slate-500 text-sm">
-        For testing, use any 5-digit code. 15% simulated failure rate.
-      </p>
-    </div>
+      </CardContent>
+    </Card>
   );
 }
-

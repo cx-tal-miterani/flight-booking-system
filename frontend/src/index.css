@@ -2,19 +2,50 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
-  font-family: 'Satoshi', system-ui, sans-serif;
-  background: linear-gradient(135deg, #0a0a0f 0%, #141419 50%, #1e1e28 100%);
-  min-height: 100vh;
-  color: #e2e8f0;
+@layer base {
+  :root {
+    --background: 222.2 84% 4.9%;
+    --foreground: 210 40% 98%;
+    --card: 222.2 84% 4.9%;
+    --card-foreground: 210 40% 98%;
+    --primary: 189 100% 50%;
+    --primary-foreground: 222.2 84% 4.9%;
+    --secondary: 217.2 32.6% 17.5%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217.2 32.6% 17.5%;
+    --muted-foreground: 215 20.2% 65.1%;
+    --accent: 217.2 32.6% 17.5%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217.2 32.6% 17.5%;
+    --input: 217.2 32.6% 17.5%;
+    --ring: 189 100% 50%;
+    --radius: 0.75rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-foreground min-h-screen;
+    font-family: 'Satoshi', system-ui, -apple-system, sans-serif;
+  }
+}
+
+/* Seat styles */
+.seat {
+  @apply w-10 h-10 sm:w-12 sm:h-12 rounded-lg text-xs font-semibold transition-all duration-200 flex items-center justify-center;
 }
 
 .seat-available {
-  @apply bg-slate-700 hover:bg-cyan-500 hover:text-slate-900 cursor-pointer transition-all;
+  @apply bg-slate-700 hover:bg-cyan-500 hover:text-slate-900 cursor-pointer hover:scale-105;
 }
 
 .seat-selected {
-  @apply bg-cyan-500 text-slate-900;
+  @apply bg-cyan-500 text-slate-900 scale-105 ring-2 ring-cyan-400 ring-offset-2 ring-offset-slate-900;
 }
 
 .seat-held {
@@ -22,6 +53,30 @@ body {
 }
 
 .seat-booked {
-  @apply bg-slate-900 cursor-not-allowed opacity-50;
+  @apply bg-slate-800 cursor-not-allowed opacity-40;
 }
 
+/* Animations */
+@keyframes pulse-ring {
+  0% {
+    transform: scale(0.95);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.05);
+    opacity: 0.7;
+  }
+  100% {
+    transform: scale(0.95);
+    opacity: 1;
+  }
+}
+
+.animate-pulse-ring {
+  animation: pulse-ring 2s ease-in-out infinite;
+}
+
+/* Responsive container */
+.container-responsive {
+  @apply w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8;
+}
