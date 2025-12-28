@@ -3,50 +3,52 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
+	"github.com/cx-tal-miterani/flight-booking-system/api-server/internal/database"
+	"github.com/cx-tal-miterani/flight-booking-system/api-server/internal/service"
 	"github.com/cx-tal-miterani/flight-booking-system/api-server/internal/service/mocks"
-	"github.com/cx-tal-miterani/flight-booking-system/shared/models"
-	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
-func setupTestRouter(h *Handler) *chi.Mux {
-	r := chi.NewRouter()
-	r.Get("/api/flights", h.GetFlights)
-	r.Get("/api/flights/{id}", h.GetFlight)
-	r.Get("/api/flights/{id}/seats", h.GetFlightSeats)
-	r.Post("/api/orders", h.CreateOrder)
-	r.Get("/api/orders/{id}", h.GetOrder)
-	r.Post("/api/orders/{id}/seats", h.SelectSeats)
-	r.Post("/api/orders/{id}/pay", h.SubmitPayment)
-	r.Delete("/api/orders/{id}", h.CancelOrder)
-	r.Get("/health", h.HealthCheck)
+func setupTestRouter(h *Handler) *mux.Router {
+	r := mux.NewRouter()
+	api := r.PathPrefix("/api").Subrouter()
+	api.HandleFunc("/flights", h.GetFlights).Methods(http.MethodGet)
+	api.HandleFunc("/flights/{id}", h.GetFlight).Methods(http.MethodGet)
+	api.HandleFunc("/flights/{id}/seats", h.GetFlightSeats).Methods(http.MethodGet)
+	api.HandleFunc("/orders", h.CreateOrder).Methods(http.MethodPost)
+	api.HandleFunc("/orders/{id}", h.GetOrder).Methods(http.MethodGet)
+	api.HandleFunc("/orders/{id}", h.CancelOrder).Methods(http.MethodDelete)
+	api.HandleFunc("/orders/{id}/seats", h.SelectSeats).Methods(http.MethodPost)
+	api.HandleFunc("/orders/{id}/pay", h.SubmitPayment).Methods(http.MethodPost)
 	return r
 }
 
 func TestHandler_GetFlights(t *testing.T) {
-	mockService := new(mocks.MockBookingService)
+	mockService := new(mocks.MockService)
 	handler := NewHandler(mockService)
 	router := setupTestRouter(handler)
 
-	expectedFlights := []*models.Flight{
+	flightID := uuid.New()
+	expectedFlights := []database.Flight{
 		{
-			ID:           "FL001",
-			FlightNumber: "AA123",
-			Origin:       "New York",
-			Destination:  "Los Angeles",
-			PricePerSeat: 150.00,
+			ID:             flightID,
+			FlightNumber:   "AA123",
+			Origin:         "New York",
+			Destination:    "Los Angeles",
+			PricePerSeat:   150.00,
+			AvailableSeats: 100,
 		},
 	}
 
-	mockService.On("GetFlights", mock.Anything).Return(expectedFlights)
+	mockService.On("GetFlights", mock.Anything).Return(expectedFlights, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/flights", nil)
 	rec := httptest.NewRecorder()
@@ -55,27 +57,30 @@ func TestHandler_GetFlights(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, rec.Code)
 
-	var response []*models.Flight
+	var response []database.Flight
 	err := json.NewDecoder(rec.Body).Decode(&response)
 	require.NoError(t, err)
 	assert.Len(t, response, 1)
+	assert.Equal(t, "AA123", response[0].FlightNumber)
 
 	mockService.AssertExpectations(t)
 }
 
 func TestHandler_GetFlight(t *testing.T) {
+	flightID := uuid.New()
+
 	tests := []struct {
 		name           string
 		flightID       string
-		mockReturn     *models.Flight
+		mockReturn     *database.Flight
 		mockError      error
 		expectedStatus int
 	}{
 		{
 			name:     "flight found",
-			flightID: "FL001",
-			mockReturn: &models.Flight{
-				ID:           "FL001",
+			flightID: flightID.String(),
+			mockReturn: &database.Flight{
+				ID:           flightID,
 				FlightNumber: "AA123",
 			},
 			mockError:      nil,
@@ -83,16 +88,16 @@ func TestHandler_GetFlight(t *testing.T) {
 		},
 		{
 			name:           "flight not found",
-			flightID:       "FL999",
+			flightID:       uuid.New().String(),
 			mockReturn:     nil,
-			mockError:      errors.New("flight not found"),
+			mockError:      database.ErrNotFound,
 			expectedStatus: http.StatusNotFound,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mockService := new(mocks.MockBookingService)
+			mockService := new(mocks.MockService)
 			handler := NewHandler(mockService)
 			router := setupTestRouter(handler)
 
@@ -110,52 +115,69 @@ func TestHandler_GetFlight(t *testing.T) {
 }
 
 func TestHandler_CreateOrder(t *testing.T) {
+	flightID := uuid.New()
+	orderID := uuid.New()
+
 	tests := []struct {
 		name           string
 		requestBody    interface{}
-		mockReturn     *models.Order
+		mockReturn     *database.Order
 		mockError      error
 		expectedStatus int
+		shouldCallMock bool
 	}{
 		{
 			name: "valid order creation",
-			requestBody: models.CreateOrderRequest{
-				FlightID:      "FL001",
+			requestBody: service.CreateOrderRequest{
+				FlightID:      flightID.String(),
 				CustomerEmail: "test@example.com",
 				CustomerName:  "John Doe",
 			},
-			mockReturn: &models.Order{
-				ID:            "abc12345",
-				FlightID:      "FL001",
+			mockReturn: &database.Order{
+				ID:            orderID,
+				FlightID:      flightID,
 				CustomerEmail: "test@example.com",
 				CustomerName:  "John Doe",
-				Status:        models.OrderStatusPending,
+				Status:        database.OrderStatusPending,
 			},
 			mockError:      nil,
 			expectedStatus: http.StatusCreated,
+			shouldCallMock: true,
 		},
 		{
 			name: "missing flight ID",
-			requestBody: models.CreateOrderRequest{
+			requestBody: service.CreateOrderRequest{
 				CustomerEmail: "test@example.com",
 				CustomerName:  "John Doe",
 			},
 			mockReturn:     nil,
 			mockError:      nil,
 			expectedStatus: http.StatusBadRequest,
+			shouldCallMock: false,
+		},
+		{
+			name: "missing customer name",
+			requestBody: service.CreateOrderRequest{
+				FlightID:      flightID.String(),
+				CustomerEmail: "test@example.com",
+			},
+			mockReturn:     nil,
+			mockError:      nil,
+			expectedStatus: http.StatusBadRequest,
+			shouldCallMock: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mockService := new(mocks.MockBookingService)
+			mockService := new(mocks.MockService)
 			handler := NewHandler(mockService)
 			router := setupTestRouter(handler)
 
 			body, _ := json.Marshal(tt.requestBody)
 
-			if tt.mockReturn != nil {
-				mockService.On("CreateOrder", mock.Anything, mock.AnythingOfType("*models.CreateOrderRequest")).Return(tt.mockReturn, tt.mockError)
+			if tt.shouldCallMock {
+				mockService.On("CreateOrder", mock.Anything, mock.AnythingOfType("service.CreateOrderRequest")).Return(tt.mockReturn, tt.mockError)
 			}
 
 			req := httptest.NewRequest(http.MethodPost, "/api/orders", bytes.NewReader(body))
@@ -169,46 +191,118 @@ func TestHandler_CreateOrder(t *testing.T) {
 	}
 }
 
-func TestHandler_SubmitPayment(t *testing.T) {
+func TestHandler_SelectSeats(t *testing.T) {
+	orderID := uuid.New()
+
 	tests := []struct {
 		name           string
 		orderID        string
-		paymentCode    string
+		requestBody    SelectSeatsRequest
+		mockReturn     *service.OrderStatusResponse
+		mockError      error
 		expectedStatus int
+		shouldCallMock bool
 	}{
 		{
-			name:           "valid payment code",
-			orderID:        "abc12345",
-			paymentCode:    "12345",
+			name:    "valid seat selection",
+			orderID: orderID.String(),
+			requestBody: SelectSeatsRequest{
+				SeatIDs: []string{"seat-1", "seat-2"},
+			},
+			mockReturn: &service.OrderStatusResponse{
+				Order:            &database.Order{ID: orderID, Status: database.OrderStatusSeatsSelected},
+				RemainingSeconds: 900,
+			},
+			mockError:      nil,
 			expectedStatus: http.StatusOK,
+			shouldCallMock: true,
 		},
 		{
-			name:           "invalid payment code - too short",
-			orderID:        "abc12345",
-			paymentCode:    "1234",
+			name:    "no seats selected",
+			orderID: orderID.String(),
+			requestBody: SelectSeatsRequest{
+				SeatIDs: []string{},
+			},
+			mockReturn:     nil,
+			mockError:      nil,
 			expectedStatus: http.StatusBadRequest,
-		},
-		{
-			name:           "invalid payment code - contains letters",
-			orderID:        "abc12345",
-			paymentCode:    "1234a",
-			expectedStatus: http.StatusBadRequest,
+			shouldCallMock: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mockService := new(mocks.MockBookingService)
+			mockService := new(mocks.MockService)
 			handler := NewHandler(mockService)
 			router := setupTestRouter(handler)
 
-			body, _ := json.Marshal(models.PaymentRequest{PaymentCode: tt.paymentCode})
+			body, _ := json.Marshal(tt.requestBody)
 
-			if tt.expectedStatus == http.StatusOK {
-				mockService.On("SubmitPayment", mock.Anything, tt.orderID, tt.paymentCode).Return(nil)
-				mockService.On("GetOrderStatus", mock.Anything, tt.orderID).Return(&models.OrderStatusResponse{
-					Order: &models.Order{ID: tt.orderID, Status: models.OrderStatusProcessing},
-				}, nil)
+			if tt.shouldCallMock {
+				mockService.On("SelectSeats", mock.Anything, tt.orderID, tt.requestBody.SeatIDs).Return(tt.mockReturn, tt.mockError)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/api/orders/"+tt.orderID+"/seats", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			router.ServeHTTP(rec, req)
+
+			assert.Equal(t, tt.expectedStatus, rec.Code)
+		})
+	}
+}
+
+func TestHandler_SubmitPayment(t *testing.T) {
+	orderID := uuid.New()
+
+	tests := []struct {
+		name           string
+		orderID        string
+		paymentCode    string
+		mockReturn     *service.OrderStatusResponse
+		mockError      error
+		expectedStatus int
+		shouldCallMock bool
+	}{
+		{
+			name:        "valid payment code",
+			orderID:     orderID.String(),
+			paymentCode: "12345",
+			mockReturn: &service.OrderStatusResponse{
+				Order:            &database.Order{ID: orderID, Status: database.OrderStatusProcessing},
+				RemainingSeconds: 800,
+			},
+			mockError:      nil,
+			expectedStatus: http.StatusOK,
+			shouldCallMock: true,
+		},
+		{
+			name:           "invalid payment code - too short",
+			orderID:        orderID.String(),
+			paymentCode:    "1234",
+			expectedStatus: http.StatusBadRequest,
+			shouldCallMock: false,
+		},
+		{
+			name:           "invalid payment code - too long",
+			orderID:        orderID.String(),
+			paymentCode:    "123456",
+			expectedStatus: http.StatusBadRequest,
+			shouldCallMock: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockService := new(mocks.MockService)
+			handler := NewHandler(mockService)
+			router := setupTestRouter(handler)
+
+			body, _ := json.Marshal(PaymentRequest{PaymentCode: tt.paymentCode})
+
+			if tt.shouldCallMock {
+				mockService.On("SubmitPayment", mock.Anything, tt.orderID, tt.paymentCode).Return(tt.mockReturn, tt.mockError)
 			}
 
 			req := httptest.NewRequest(http.MethodPost, "/api/orders/"+tt.orderID+"/pay", bytes.NewReader(body))
@@ -222,21 +316,96 @@ func TestHandler_SubmitPayment(t *testing.T) {
 	}
 }
 
-func TestHandler_HealthCheck(t *testing.T) {
-	mockService := new(mocks.MockBookingService)
-	handler := NewHandler(mockService)
-	router := setupTestRouter(handler)
+func TestHandler_CancelOrder(t *testing.T) {
+	orderID := uuid.New()
 
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
-	rec := httptest.NewRecorder()
+	tests := []struct {
+		name           string
+		orderID        string
+		mockError      error
+		expectedStatus int
+	}{
+		{
+			name:           "successful cancellation",
+			orderID:        orderID.String(),
+			mockError:      nil,
+			expectedStatus: http.StatusNoContent,
+		},
+		{
+			name:           "order not found",
+			orderID:        uuid.New().String(),
+			mockError:      database.ErrNotFound,
+			expectedStatus: http.StatusNotFound,
+		},
+	}
 
-	router.ServeHTTP(rec, req)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockService := new(mocks.MockService)
+			handler := NewHandler(mockService)
+			router := setupTestRouter(handler)
 
-	assert.Equal(t, http.StatusOK, rec.Code)
+			mockService.On("CancelOrder", mock.Anything, tt.orderID).Return(tt.mockError)
 
-	var response map[string]string
-	err := json.NewDecoder(rec.Body).Decode(&response)
-	require.NoError(t, err)
-	assert.Equal(t, "healthy", response["status"])
+			req := httptest.NewRequest(http.MethodDelete, "/api/orders/"+tt.orderID, nil)
+			rec := httptest.NewRecorder()
+
+			router.ServeHTTP(rec, req)
+
+			assert.Equal(t, tt.expectedStatus, rec.Code)
+			mockService.AssertExpectations(t)
+		})
+	}
 }
 
+func TestHandler_GetOrder(t *testing.T) {
+	orderID := uuid.New()
+
+	tests := []struct {
+		name           string
+		orderID        string
+		mockReturn     *service.OrderStatusResponse
+		mockError      error
+		expectedStatus int
+	}{
+		{
+			name:    "order found",
+			orderID: orderID.String(),
+			mockReturn: &service.OrderStatusResponse{
+				Order: &database.Order{
+					ID:              orderID,
+					Status:          database.OrderStatusSeatsSelected,
+					PaymentAttempts: 0,
+				},
+				RemainingSeconds: 850,
+			},
+			mockError:      nil,
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "order not found",
+			orderID:        uuid.New().String(),
+			mockReturn:     nil,
+			mockError:      database.ErrNotFound,
+			expectedStatus: http.StatusNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockService := new(mocks.MockService)
+			handler := NewHandler(mockService)
+			router := setupTestRouter(handler)
+
+			mockService.On("GetOrder", mock.Anything, tt.orderID).Return(tt.mockReturn, tt.mockError)
+
+			req := httptest.NewRequest(http.MethodGet, "/api/orders/"+tt.orderID, nil)
+			rec := httptest.NewRecorder()
+
+			router.ServeHTTP(rec, req)
+
+			assert.Equal(t, tt.expectedStatus, rec.Code)
+			mockService.AssertExpectations(t)
+		})
+	}
+}
