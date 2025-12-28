@@ -2,249 +2,212 @@ package activities
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
-	"sync"
 	"time"
 
-	"github.com/cx-tal-miterani/flight-booking-system/shared/models"
+	"github.com/cx-tal-miterani/flight-booking-system/temporal-worker/internal/repository"
+	"github.com/google/uuid"
 	"go.temporal.io/sdk/activity"
 )
 
-const (
-	PaymentFailureRate = 0.15 // 15% failure rate
-	SeatHoldDuration   = 15 * time.Minute
-)
-
-// SeatInventory manages seat state in memory (can be replaced with DB)
-type SeatInventory struct {
-	mu     sync.RWMutex
-	seats  map[string]*models.Seat // seatID -> Seat
-	holds  map[string]string       // seatID -> orderID
-	expiry map[string]time.Time    // seatID -> expiry time
+// Activities contains all workflow activities
+type Activities struct {
+	repo *repository.Repository
 }
 
-var inventory = &SeatInventory{
-	seats:  make(map[string]*models.Seat),
-	holds:  make(map[string]string),
-	expiry: make(map[string]time.Time),
+// NewActivities creates a new Activities instance
+func NewActivities(repo *repository.Repository) *Activities {
+	return &Activities{repo: repo}
 }
 
-// InitializeInventory sets up initial seat inventory for a flight
-func InitializeInventory(flightID string, rows int, columns []string, pricePerSeat float64) {
-	inventory.mu.Lock()
-	defer inventory.mu.Unlock()
-
-	for row := 1; row <= rows; row++ {
-		for _, col := range columns {
-			seatID := fmt.Sprintf("%s-%d%s", flightID, row, col)
-			inventory.seats[seatID] = &models.Seat{
-				ID:       seatID,
-				FlightID: flightID,
-				Row:      row,
-				Column:   col,
-				Class:    models.SeatClassEconomy,
-				Status:   models.SeatStatusAvailable,
-				Price:    pricePerSeat,
-			}
-		}
-	}
+// ValidatePaymentInput is the input for ValidatePayment activity
+type ValidatePaymentInput struct {
+	OrderID     string `json:"orderId"`
+	PaymentCode string `json:"paymentCode"`
+	Attempt     int    `json:"attempt"`
 }
 
-// GetAvailableSeats returns all available seats for a flight
-func GetAvailableSeats(flightID string) []*models.Seat {
-	inventory.mu.RLock()
-	defer inventory.mu.RUnlock()
-
-	var available []*models.Seat
-	for _, seat := range inventory.seats {
-		if seat.FlightID == flightID && seat.Status == models.SeatStatusAvailable {
-			available = append(available, seat)
-		}
-	}
-	return available
+// ValidatePaymentOutput is the output for ValidatePayment activity
+type ValidatePaymentOutput struct {
+	Success       bool   `json:"success"`
+	TransactionID string `json:"transactionId,omitempty"`
+	ErrorMessage  string `json:"errorMessage,omitempty"`
 }
 
-// ReserveSeats activity - reserves seats for an order
-func ReserveSeats(ctx context.Context, orderID, flightID string, seatIDs []string) (*models.ReserveSeatsResult, error) {
+// ValidatePayment validates a payment code (simulated)
+// 85% success rate, must complete within 10 seconds
+func (a *Activities) ValidatePayment(ctx context.Context, input ValidatePaymentInput) (*ValidatePaymentOutput, error) {
 	logger := activity.GetLogger(ctx)
-	logger.Info("Reserving seats", "orderID", orderID, "seats", seatIDs)
+	logger.Info("Validating payment", "orderId", input.OrderID, "attempt", input.Attempt)
 
-	inventory.mu.Lock()
-	defer inventory.mu.Unlock()
-
-	// First check all seats are available
-	var totalAmount float64
-	for _, seatID := range seatIDs {
-		seat, exists := inventory.seats[seatID]
-		if !exists {
-			return &models.ReserveSeatsResult{
-				Success: false,
-				Error:   fmt.Sprintf("Seat %s not found", seatID),
-			}, nil
-		}
-
-		// Check if seat is available or held by same order
-		if seat.Status != models.SeatStatusAvailable {
-			if existingOrder, held := inventory.holds[seatID]; held && existingOrder == orderID {
-				// Same order, refresh the hold
-				continue
-			}
-			// Check if hold has expired
-			if expiry, hasExpiry := inventory.expiry[seatID]; hasExpiry && time.Now().After(expiry) {
-				// Hold expired, seat can be claimed
-				seat.Status = models.SeatStatusAvailable
-				delete(inventory.holds, seatID)
-				delete(inventory.expiry, seatID)
-			} else {
-				return &models.ReserveSeatsResult{
-					Success: false,
-					Error:   fmt.Sprintf("Seat %s is not available", seatID),
-				}, nil
-			}
-		}
-		totalAmount += seat.Price
+	orderID, err := uuid.Parse(input.OrderID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid order ID: %w", err)
 	}
 
-	// Reserve all seats
-	holdExpiry := time.Now().Add(SeatHoldDuration)
-	for _, seatID := range seatIDs {
-		seat := inventory.seats[seatID]
-		seat.Status = models.SeatStatusHeld
-		inventory.holds[seatID] = orderID
-		inventory.expiry[seatID] = holdExpiry
+	// Validate payment code format
+	if len(input.PaymentCode) != 5 {
+		return &ValidatePaymentOutput{
+			Success:      false,
+			ErrorMessage: "Invalid payment code format",
+		}, nil
 	}
 
-	logger.Info("Seats reserved successfully", "orderID", orderID, "total", totalAmount)
+	// Simulate payment processing time (1-3 seconds)
+	processingTime := time.Duration(1000+rand.Intn(2000)) * time.Millisecond
+	time.Sleep(processingTime)
 
-	return &models.ReserveSeatsResult{
-		Success:     true,
-		SeatIDs:     seatIDs,
-		TotalAmount: totalAmount,
-		HoldExpiry:  holdExpiry,
+	// Simulate 85% success rate
+	success := rand.Float32() < 0.85
+
+	if success {
+		// Update order status and book seats
+		if err := a.repo.UpdateOrderStatus(ctx, orderID, repository.OrderStatusConfirmed); err != nil {
+			return nil, fmt.Errorf("failed to update order: %w", err)
+		}
+		if err := a.repo.BookSeats(ctx, orderID); err != nil {
+			return nil, fmt.Errorf("failed to book seats: %w", err)
+		}
+
+		transactionID := fmt.Sprintf("TXN-%s-%d", input.OrderID[:8], time.Now().Unix())
+		logger.Info("Payment successful", "transactionId", transactionID)
+
+		return &ValidatePaymentOutput{
+			Success:       true,
+			TransactionID: transactionID,
+		}, nil
+	}
+
+	// Payment failed - update attempts
+	failureReason := "Payment validation failed"
+	if err := a.repo.UpdateOrderPayment(ctx, orderID, input.Attempt, &failureReason); err != nil {
+		logger.Warn("Failed to update payment attempts", "error", err)
+	}
+
+	logger.Info("Payment failed", "attempt", input.Attempt)
+	return &ValidatePaymentOutput{
+		Success:      false,
+		ErrorMessage: "Payment validation failed. Please try again.",
 	}, nil
 }
 
-// ReleaseSeats activity - releases held seats
-func ReleaseSeats(ctx context.Context, orderID string, seatIDs []string) error {
+// ReserveSeatsInput is the input for ReserveSeats activity
+type ReserveSeatsInput struct {
+	OrderID string   `json:"orderId"`
+	SeatIDs []string `json:"seatIds"`
+}
+
+// ReserveSeats activity (seat reservation is handled via API, this is for workflow tracking)
+func (a *Activities) ReserveSeats(ctx context.Context, input ReserveSeatsInput) error {
 	logger := activity.GetLogger(ctx)
-	logger.Info("Releasing seats", "orderID", orderID, "seats", seatIDs)
+	logger.Info("Seats reserved via API", "orderId", input.OrderID, "seatCount", len(input.SeatIDs))
+	return nil
+}
 
-	inventory.mu.Lock()
-	defer inventory.mu.Unlock()
+// ReleaseSeatsInput is the input for ReleaseSeats activity
+type ReleaseSeatsInput struct {
+	OrderID string `json:"orderId"`
+	Reason  string `json:"reason"`
+}
 
-	for _, seatID := range seatIDs {
-		seat, exists := inventory.seats[seatID]
-		if !exists {
-			continue
-		}
+// ReleaseSeats releases held seats
+func (a *Activities) ReleaseSeats(ctx context.Context, input ReleaseSeatsInput) error {
+	logger := activity.GetLogger(ctx)
+	logger.Info("Releasing seats", "orderId", input.OrderID, "reason", input.Reason)
 
-		// Only release if held by this order
-		if holdOrder, held := inventory.holds[seatID]; held && holdOrder == orderID {
-			seat.Status = models.SeatStatusAvailable
-			delete(inventory.holds, seatID)
-			delete(inventory.expiry, seatID)
-		}
+	orderID, err := uuid.Parse(input.OrderID)
+	if err != nil {
+		return fmt.Errorf("invalid order ID: %w", err)
+	}
+
+	if err := a.repo.ReleaseSeats(ctx, orderID); err != nil {
+		return fmt.Errorf("failed to release seats: %w", err)
+	}
+
+	// Update order status based on reason
+	var status repository.OrderStatus
+	switch input.Reason {
+	case "expired":
+		status = repository.OrderStatusExpired
+	case "cancelled":
+		status = repository.OrderStatusCancelled
+	case "payment_failed":
+		status = repository.OrderStatusFailed
+	default:
+		status = repository.OrderStatusFailed
+	}
+
+	if err := a.repo.UpdateOrderStatus(ctx, orderID, status); err != nil {
+		return fmt.Errorf("failed to update order status: %w", err)
 	}
 
 	return nil
 }
 
-// ValidatePayment activity - validates payment code with simulated failures
-func ValidatePayment(ctx context.Context, orderID, paymentCode string, amount float64) (*models.ValidatePaymentResult, error) {
+// SendConfirmationInput is the input for SendConfirmation activity
+type SendConfirmationInput struct {
+	OrderID       string `json:"orderId"`
+	CustomerEmail string `json:"customerEmail"`
+	CustomerName  string `json:"customerName"`
+	FlightNumber  string `json:"flightNumber"`
+	TransactionID string `json:"transactionId"`
+}
+
+// SendConfirmation sends a booking confirmation (simulated)
+func (a *Activities) SendConfirmation(ctx context.Context, input SendConfirmationInput) error {
 	logger := activity.GetLogger(ctx)
-	logger.Info("Validating payment", "orderID", orderID, "amount", amount)
+	logger.Info("Sending confirmation email",
+		"orderId", input.OrderID,
+		"email", input.CustomerEmail,
+		"transactionId", input.TransactionID,
+	)
 
-	// Validate payment code format (5 digits)
-	if len(paymentCode) != 5 {
-		return &models.ValidatePaymentResult{
-			Success:  false,
-			Error:    "Payment code must be 5 digits",
-			CanRetry: false,
-		}, nil
-	}
-
-	for _, c := range paymentCode {
-		if c < '0' || c > '9' {
-			return &models.ValidatePaymentResult{
-				Success:  false,
-				Error:    "Payment code must contain only digits",
-				CanRetry: false,
-			}, nil
-		}
-	}
-
-	// Simulate payment processing delay
+	// Simulate sending email
 	time.Sleep(500 * time.Millisecond)
 
-	// Simulate 15% failure rate
-	if rand.Float64() < PaymentFailureRate {
-		logger.Warn("Payment failed (simulated)", "orderID", orderID)
-		return &models.ValidatePaymentResult{
-			Success:  false,
-			Error:    "Payment declined by provider",
-			CanRetry: true,
-		}, nil
+	logger.Info("Confirmation email sent successfully")
+	return nil
+}
+
+// CheckReservationExpiryInput is the input for CheckReservationExpiry activity
+type CheckReservationExpiryInput struct {
+	OrderID string `json:"orderId"`
+}
+
+// CheckReservationExpiry checks if the reservation has expired
+func (a *Activities) CheckReservationExpiry(ctx context.Context, input CheckReservationExpiryInput) (bool, error) {
+	orderID, err := uuid.Parse(input.OrderID)
+	if err != nil {
+		return false, fmt.Errorf("invalid order ID: %w", err)
 	}
 
-	logger.Info("Payment validated successfully", "orderID", orderID)
-	return &models.ValidatePaymentResult{
-		Success: true,
-	}, nil
-}
-
-// ConfirmBooking activity - confirms the booking and marks seats as booked
-func ConfirmBooking(ctx context.Context, orderID string, seatIDs []string) (*models.ConfirmBookingResult, error) {
-	logger := activity.GetLogger(ctx)
-	logger.Info("Confirming booking", "orderID", orderID, "seats", seatIDs)
-
-	inventory.mu.Lock()
-	defer inventory.mu.Unlock()
-
-	// Mark all seats as booked
-	for _, seatID := range seatIDs {
-		seat, exists := inventory.seats[seatID]
-		if !exists {
-			return &models.ConfirmBookingResult{
-				Success: false,
-				Error:   fmt.Sprintf("Seat %s not found", seatID),
-			}, nil
-		}
-
-		// Verify seat is held by this order
-		if holdOrder, held := inventory.holds[seatID]; !held || holdOrder != orderID {
-			return &models.ConfirmBookingResult{
-				Success: false,
-				Error:   fmt.Sprintf("Seat %s is not held by this order", seatID),
-			}, nil
-		}
-
-		seat.Status = models.SeatStatusBooked
-		delete(inventory.holds, seatID)
-		delete(inventory.expiry, seatID)
+	expiresAt, err := a.repo.GetReservationExpiry(ctx, orderID)
+	if err != nil {
+		return false, err
 	}
 
-	// Generate confirmation code
-	confirmationCode := fmt.Sprintf("FLT%s%d", orderID[:4], time.Now().Unix()%10000)
+	if expiresAt == nil {
+		return false, errors.New("no reservation found")
+	}
 
-	logger.Info("Booking confirmed", "orderID", orderID, "confirmation", confirmationCode)
-	return &models.ConfirmBookingResult{
-		Success:          true,
-		ConfirmationCode: confirmationCode,
-	}, nil
+	return time.Now().After(*expiresAt), nil
 }
 
-// GetSeatInventory returns the current inventory (for testing/debugging)
-func GetSeatInventory() *SeatInventory {
-	return inventory
+// UpdateOrderStatusInput is the input for UpdateOrderStatus activity
+type UpdateOrderStatusInput struct {
+	OrderID string `json:"orderId"`
+	Status  string `json:"status"`
 }
 
-// ResetInventory clears all seats (for testing)
-func ResetInventory() {
-	inventory.mu.Lock()
-	defer inventory.mu.Unlock()
-	inventory.seats = make(map[string]*models.Seat)
-	inventory.holds = make(map[string]string)
-	inventory.expiry = make(map[string]time.Time)
-}
+// UpdateOrderStatus updates the order status in the database
+func (a *Activities) UpdateOrderStatus(ctx context.Context, input UpdateOrderStatusInput) error {
+	orderID, err := uuid.Parse(input.OrderID)
+	if err != nil {
+		return fmt.Errorf("invalid order ID: %w", err)
+	}
 
+	status := repository.OrderStatus(input.Status)
+	return a.repo.UpdateOrderStatus(ctx, orderID, status)
+}

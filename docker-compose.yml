@@ -1,91 +1,115 @@
 version: '3.8'
 
 services:
-  # Temporal Server (development mode)
-  temporal:
-    image: temporalio/auto-setup:1.22
-    ports:
-      - "7233:7233"
-    environment:
-      - DB=postgresql
-      - DB_PORT=5432
-      - POSTGRES_USER=temporal
-      - POSTGRES_PWD=temporal
-      - POSTGRES_SEEDS=postgres
-    depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "temporal", "workflow", "list", "--namespace", "default"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
-  # Temporal UI
-  temporal-ui:
-    image: temporalio/ui:2.21.3
-    ports:
-      - "8088:8080"
-    environment:
-      - TEMPORAL_ADDRESS=temporal:7233
-      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
-    depends_on:
-      - temporal
-
-  # PostgreSQL for Temporal
+  # PostgreSQL Database
   postgres:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
+    container_name: flight-booking-postgres
     environment:
-      - POSTGRES_USER=temporal
-      - POSTGRES_PASSWORD=temporal
+      POSTGRES_USER: flightbooking
+      POSTGRES_PASSWORD: flightbooking123
+      POSTGRES_DB: flightbooking
+    ports:
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      test: ["CMD-SHELL", "pg_isready -U flightbooking -d flightbooking"]
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - flight-booking-network
+
+  # Temporal Server (uses PostgreSQL)
+  temporal:
+    image: temporalio/auto-setup:1.22
+    container_name: flight-booking-temporal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=flightbooking
+      - POSTGRES_PWD=flightbooking123
+      - POSTGRES_SEEDS=postgres
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development.yaml
+    ports:
+      - "7233:7233"
+    volumes:
+      - ./temporal-config:/etc/temporal/config/dynamicconfig
+    networks:
+      - flight-booking-network
+
+  # Temporal Web UI
+  temporal-ui:
+    image: temporalio/ui:2.21.3
+    container_name: flight-booking-temporal-ui
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    ports:
+      - "8080:8080"
+    networks:
+      - flight-booking-network
 
   # API Server
   api-server:
     build:
       context: .
       dockerfile: api-server/Dockerfile
-    ports:
-      - "8080:8080"
-    environment:
-      - API_PORT=8080
-      - TEMPORAL_HOST=temporal:7233
+    container_name: flight-booking-api
     depends_on:
-      temporal:
+      postgres:
         condition: service_healthy
+      temporal:
+        condition: service_started
+    environment:
+      - DATABASE_URL=postgres://flightbooking:flightbooking123@postgres:5432/flightbooking?sslmode=disable
+      - TEMPORAL_HOST=temporal:7233
+      - PORT=8081
+    ports:
+      - "8081:8081"
+    networks:
+      - flight-booking-network
 
   # Temporal Worker
   temporal-worker:
     build:
       context: .
       dockerfile: temporal-worker/Dockerfile
-    environment:
-      - TEMPORAL_HOST=temporal:7233
+    container_name: flight-booking-worker
     depends_on:
-      temporal:
+      postgres:
         condition: service_healthy
+      temporal:
+        condition: service_started
+    environment:
+      - DATABASE_URL=postgres://flightbooking:flightbooking123@postgres:5432/flightbooking?sslmode=disable
+      - TEMPORAL_HOST=temporal:7233
+    networks:
+      - flight-booking-network
 
   # Frontend
   frontend:
     build:
       context: frontend
       dockerfile: Dockerfile
-    ports:
-      - "3000:80"
+    container_name: flight-booking-frontend
     depends_on:
       - api-server
+    ports:
+      - "3000:80"
+    networks:
+      - flight-booking-network
 
 volumes:
   postgres_data:
 
 networks:
-  default:
-    name: flight-booking-network
-
+  flight-booking-network:
+    driver: bridge

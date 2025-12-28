@@ -1,0 +1,5 @@
+# Temporal dynamic configuration
+frontend.enableClientVersionCheck:
+  - value: true
+    constraints: {}
+

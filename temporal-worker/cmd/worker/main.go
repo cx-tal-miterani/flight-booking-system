@@ -1,78 +1,79 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
 
 	"github.com/cx-tal-miterani/flight-booking-system/temporal-worker/internal/activities"
+	"github.com/cx-tal-miterani/flight-booking-system/temporal-worker/internal/repository"
 	"github.com/cx-tal-miterani/flight-booking-system/temporal-worker/internal/workflows"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 )
 
-const (
-	TaskQueue   = "flight-booking-queue"
-	DefaultHost = "localhost:7233"
-)
-
 func main() {
-	// Get Temporal host from environment
-	temporalHost := os.Getenv("TEMPORAL_HOST")
-	if temporalHost == "" {
-		temporalHost = DefaultHost
-	}
+	ctx := context.Background()
 
-	// Create Temporal client
+	// Get configuration
+	temporalHost := getEnv("TEMPORAL_HOST", "localhost:7233")
+	dbURL := getEnv("DATABASE_URL", "postgres://flightbooking:flightbooking123@localhost:5432/flightbooking?sslmode=disable")
+
+	// Connect to database
+	log.Println("Connecting to database...")
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	if err := pool.Ping(ctx); err != nil {
+		log.Fatalf("Failed to ping database: %v", err)
+	}
+	log.Println("Connected to database")
+
+	// Create repository
+	repo := repository.NewRepository(pool)
+
+	// Connect to Temporal
+	log.Printf("Connecting to Temporal at %s...", temporalHost)
 	c, err := client.Dial(client.Options{
 		HostPort: temporalHost,
 	})
 	if err != nil {
-		log.Fatalf("Failed to create Temporal client: %v", err)
+		log.Fatalf("Failed to connect to Temporal: %v", err)
 	}
 	defer c.Close()
-
-	// Initialize seat inventory with sample data
-	initializeSampleData()
+	log.Println("Connected to Temporal")
 
 	// Create worker
-	w := worker.New(c, TaskQueue, worker.Options{})
+	w := worker.New(c, "flight-booking-queue", worker.Options{})
 
 	// Register workflows
 	w.RegisterWorkflow(workflows.BookingWorkflow)
 
-	// Register activities
-	w.RegisterActivity(activities.ReserveSeats)
-	w.RegisterActivity(activities.ReleaseSeats)
-	w.RegisterActivity(activities.ValidatePayment)
-	w.RegisterActivity(activities.ConfirmBooking)
-
-	log.Printf("Starting Temporal worker on task queue: %s", TaskQueue)
-	log.Printf("Connected to Temporal server at: %s", temporalHost)
+	// Create and register activities
+	acts := activities.NewActivities(repo)
+	w.RegisterActivityWithOptions(acts.ValidatePayment, worker.RegisterActivityOptions{Name: "ValidatePayment"})
+	w.RegisterActivityWithOptions(acts.ReserveSeats, worker.RegisterActivityOptions{Name: "ReserveSeats"})
+	w.RegisterActivityWithOptions(acts.ReleaseSeats, worker.RegisterActivityOptions{Name: "ReleaseSeats"})
+	w.RegisterActivityWithOptions(acts.SendConfirmation, worker.RegisterActivityOptions{Name: "SendConfirmation"})
+	w.RegisterActivityWithOptions(acts.CheckReservationExpiry, worker.RegisterActivityOptions{Name: "CheckReservationExpiry"})
+	w.RegisterActivityWithOptions(acts.UpdateOrderStatus, worker.RegisterActivityOptions{Name: "UpdateOrderStatus"})
 
 	// Start worker
-	if err := w.Run(worker.InterruptCh()); err != nil {
+	log.Println("Starting Temporal worker...")
+	err = w.Run(worker.InterruptCh())
+	if err != nil {
 		log.Fatalf("Worker failed: %v", err)
 	}
 }
 
-func initializeSampleData() {
-	// Initialize sample flights with seats
-	flights := []struct {
-		id    string
-		rows  int
-		price float64
-	}{
-		{"FL001", 30, 150.00},
-		{"FL002", 25, 200.00},
-		{"FL003", 35, 120.00},
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
-
-	columns := []string{"A", "B", "C", "D", "E", "F"}
-
-	for _, flight := range flights {
-		activities.InitializeInventory(flight.id, flight.rows, columns, flight.price)
-		log.Printf("Initialized inventory for flight %s: %d rows x %d columns",
-			flight.id, flight.rows, len(columns))
-	}
+	return defaultValue
 }
-

@@ -3,265 +3,235 @@ package workflows
 import (
 	"time"
 
-	"github.com/cx-tal-miterani/flight-booking-system/shared/models"
 	"github.com/cx-tal-miterani/flight-booking-system/temporal-worker/internal/activities"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
 
 const (
-	SeatHoldTimeout   = 15 * time.Minute
-	PaymentTimeout    = 10 * time.Second
-	MaxPaymentRetries = 3
+	// SeatHoldDuration is how long seats are held (15 minutes)
+	SeatHoldDuration = 15 * time.Minute
+	// PaymentTimeout is how long to wait for payment validation (10 seconds)
+	PaymentTimeout = 10 * time.Second
+	// MaxPaymentAttempts is the maximum number of payment retries
+	MaxPaymentAttempts = 3
 )
 
-// BookingWorkflow orchestrates the entire flight booking process
-func BookingWorkflow(ctx workflow.Context, input models.BookingWorkflowInput) (*models.Order, error) {
+// BookingWorkflowInput is the input for the booking workflow
+type BookingWorkflowInput struct {
+	OrderID       string `json:"orderId"`
+	FlightID      string `json:"flightId"`
+	CustomerName  string `json:"customerName"`
+	CustomerEmail string `json:"customerEmail"`
+}
+
+// BookingWorkflowResult is the result of the booking workflow
+type BookingWorkflowResult struct {
+	Success       bool   `json:"success"`
+	TransactionID string `json:"transactionId,omitempty"`
+	FailureReason string `json:"failureReason,omitempty"`
+}
+
+// SeatsSelectedSignal is the signal for seat selection
+type SeatsSelectedSignal struct {
+	SeatIDs   []string  `json:"seatIds"`
+	ExpiresAt time.Time `json:"expiresAt"`
+}
+
+// PaymentSubmittedSignal is the signal for payment submission
+type PaymentSubmittedSignal struct {
+	PaymentCode string `json:"paymentCode"`
+}
+
+// BookingWorkflow orchestrates the flight booking process
+func BookingWorkflow(ctx workflow.Context, input BookingWorkflowInput) (*BookingWorkflowResult, error) {
 	logger := workflow.GetLogger(ctx)
-	logger.Info("Starting booking workflow", "orderId", input.OrderID)
+	logger.Info("Booking workflow started", "orderId", input.OrderID)
 
-	// Initialize workflow state
-	state := &models.BookingWorkflowState{
-		OrderID:     input.OrderID,
-		Status:      models.OrderStatusPending,
-		LastUpdated: workflow.Now(ctx),
-	}
-
-	// Activity options with retry policy
+	// Activity options
 	activityOpts := workflow.ActivityOptions{
 		StartToCloseTimeout: 30 * time.Second,
 		RetryPolicy: &temporal.RetryPolicy{
 			InitialInterval:    time.Second,
 			BackoffCoefficient: 2.0,
+			MaximumInterval:    time.Minute,
 			MaximumAttempts:    3,
 		},
 	}
 	ctx = workflow.WithActivityOptions(ctx, activityOpts)
 
-	// Set up query handler for state
-	if err := workflow.SetQueryHandler(ctx, models.QueryGetState, func() (*models.BookingWorkflowState, error) {
-		return state, nil
-	}); err != nil {
-		return nil, err
-	}
-
-	// Channels for signals
-	selectSeatsCh := workflow.GetSignalChannel(ctx, models.SignalSelectSeats)
-	submitPaymentCh := workflow.GetSignalChannel(ctx, models.SignalSubmitPayment)
-	cancelOrderCh := workflow.GetSignalChannel(ctx, models.SignalCancelOrder)
-	refreshTimerCh := workflow.GetSignalChannel(ctx, models.SignalRefreshTimer)
-
-	// If seats were provided in input, reserve them immediately
-	if len(input.SeatIDs) > 0 {
-		result, err := reserveSeats(ctx, input.OrderID, input.FlightID, input.SeatIDs)
-		if err != nil {
-			state.Status = models.OrderStatusFailed
-			state.FailureReason = err.Error()
-			return buildOrder(state, input), err
-		}
-		state.SeatIDs = result.SeatIDs
-		state.TotalAmount = result.TotalAmount
-		state.SeatHoldExpiry = result.HoldExpiry
-		state.Status = models.OrderStatusSeatsSelected
-	}
-
-	// Main workflow loop - wait for signals or timeout
-	for {
-		timerDuration := SeatHoldTimeout
-		if !state.SeatHoldExpiry.IsZero() {
-			timerDuration = state.SeatHoldExpiry.Sub(workflow.Now(ctx))
-			if timerDuration <= 0 {
-				// Timer already expired
-				state.Status = models.OrderStatusExpired
-				state.FailureReason = "Seat hold expired"
-				releaseSeats(ctx, input.OrderID, state.SeatIDs)
-				return buildOrder(state, input), nil
-			}
-		}
-
-		selector := workflow.NewSelector(ctx)
-
-		// Handle seat selection signal
-		selector.AddReceive(selectSeatsCh, func(c workflow.ReceiveChannel, more bool) {
-			var signal models.SelectSeatsSignal
-			c.Receive(ctx, &signal)
-			logger.Info("Received select seats signal", "seats", signal.SeatIDs)
-
-			// Release previously held seats if any
-			if len(state.SeatIDs) > 0 {
-				releaseSeats(ctx, input.OrderID, state.SeatIDs)
-			}
-
-			// Reserve new seats
-			result, err := reserveSeats(ctx, input.OrderID, input.FlightID, signal.SeatIDs)
-			if err != nil {
-				state.FailureReason = err.Error()
-				return
-			}
-			state.SeatIDs = result.SeatIDs
-			state.TotalAmount = result.TotalAmount
-			state.SeatHoldExpiry = result.HoldExpiry
-			state.Status = models.OrderStatusSeatsSelected
-			state.FailureReason = ""
-			state.LastUpdated = workflow.Now(ctx)
-		})
-
-		// Handle payment submission signal
-		selector.AddReceive(submitPaymentCh, func(c workflow.ReceiveChannel, more bool) {
-			var signal models.SubmitPaymentSignal
-			c.Receive(ctx, &signal)
-			logger.Info("Received payment signal")
-
-			if len(state.SeatIDs) == 0 {
-				state.FailureReason = "No seats selected"
-				return
-			}
-
-			state.Status = models.OrderStatusProcessing
-
-			// Process payment with retries
-			for attempt := 1; attempt <= MaxPaymentRetries; attempt++ {
-				state.PaymentAttempts = attempt
-				state.LastUpdated = workflow.Now(ctx)
-
-				result, err := validatePayment(ctx, input.OrderID, signal.PaymentCode, state.TotalAmount)
-				if err != nil {
-					logger.Error("Payment validation error", "error", err, "attempt", attempt)
-					continue
-				}
-
-				if result.Success {
-					// Payment successful - confirm booking
-					confirmResult, err := confirmBooking(ctx, input.OrderID, state.SeatIDs)
-					if err != nil {
-						state.Status = models.OrderStatusFailed
-						state.FailureReason = "Failed to confirm booking: " + err.Error()
-						return
-					}
-					if confirmResult.Success {
-						state.Status = models.OrderStatusConfirmed
-						state.FailureReason = ""
-						return
-					}
-					state.Status = models.OrderStatusFailed
-					state.FailureReason = confirmResult.Error
-					return
-				}
-
-				if !result.CanRetry || attempt >= MaxPaymentRetries {
-					state.Status = models.OrderStatusFailed
-					state.FailureReason = result.Error
-					releaseSeats(ctx, input.OrderID, state.SeatIDs)
-					return
-				}
-
-				// Wait before retry
-				workflow.Sleep(ctx, time.Second)
-			}
-		})
-
-		// Handle cancel signal
-		selector.AddReceive(cancelOrderCh, func(c workflow.ReceiveChannel, more bool) {
-			c.Receive(ctx, nil)
-			logger.Info("Received cancel signal")
-			state.Status = models.OrderStatusCancelled
-			if len(state.SeatIDs) > 0 {
-				releaseSeats(ctx, input.OrderID, state.SeatIDs)
-			}
-		})
-
-		// Handle timer refresh signal
-		selector.AddReceive(refreshTimerCh, func(c workflow.ReceiveChannel, more bool) {
-			c.Receive(ctx, nil)
-			logger.Info("Received timer refresh signal")
-			if len(state.SeatIDs) > 0 && state.Status == models.OrderStatusSeatsSelected {
-				state.SeatHoldExpiry = workflow.Now(ctx).Add(SeatHoldTimeout)
-				state.LastUpdated = workflow.Now(ctx)
-			}
-		})
-
-		// Handle timeout
-		timerFuture := workflow.NewTimer(ctx, timerDuration)
-		selector.AddFuture(timerFuture, func(f workflow.Future) {
-			logger.Info("Seat hold timer expired")
-			if state.Status == models.OrderStatusSeatsSelected {
-				state.Status = models.OrderStatusExpired
-				state.FailureReason = "Seat hold expired"
-				releaseSeats(ctx, input.OrderID, state.SeatIDs)
-			}
-		})
-
-		selector.Select(ctx)
-		state.LastUpdated = workflow.Now(ctx)
-
-		// Check for terminal states
-		if state.Status == models.OrderStatusConfirmed ||
-			state.Status == models.OrderStatusFailed ||
-			state.Status == models.OrderStatusCancelled ||
-			state.Status == models.OrderStatusExpired {
-			break
-		}
-	}
-
-	return buildOrder(state, input), nil
-}
-
-func reserveSeats(ctx workflow.Context, orderID, flightID string, seatIDs []string) (*models.ReserveSeatsResult, error) {
-	var result models.ReserveSeatsResult
-	err := workflow.ExecuteActivity(ctx, activities.ReserveSeats, orderID, flightID, seatIDs).Get(ctx, &result)
-	if err != nil {
-		return nil, err
-	}
-	if !result.Success {
-		return nil, temporal.NewApplicationError(result.Error, "SEAT_RESERVATION_FAILED")
-	}
-	return &result, nil
-}
-
-func releaseSeats(ctx workflow.Context, orderID string, seatIDs []string) {
-	// Fire and forget - use local activity for quick execution
-	_ = workflow.ExecuteActivity(ctx, activities.ReleaseSeats, orderID, seatIDs)
-}
-
-func validatePayment(ctx workflow.Context, orderID, paymentCode string, amount float64) (*models.ValidatePaymentResult, error) {
-	// Payment has its own timeout
+	// Payment activity with shorter timeout (10 seconds)
 	paymentCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: PaymentTimeout,
 		RetryPolicy: &temporal.RetryPolicy{
-			MaximumAttempts: 1, // We handle retries in the workflow
+			MaximumAttempts: 1, // No automatic retries for payment
 		},
 	})
 
-	var result models.ValidatePaymentResult
-	err := workflow.ExecuteActivity(paymentCtx, activities.ValidatePayment, orderID, paymentCode, amount).Get(paymentCtx, &result)
+	// Channels for signals
+	seatsSelectedCh := workflow.GetSignalChannel(ctx, "seats-selected")
+	paymentSubmittedCh := workflow.GetSignalChannel(ctx, "payment-submitted")
+
+	var seatsSelected bool
+	var paymentAttempts int
+	var reservationExpiry time.Time
+
+	// Update order status to pending
+	err := workflow.ExecuteActivity(ctx, "UpdateOrderStatus", activities.UpdateOrderStatusInput{
+		OrderID: input.OrderID,
+		Status:  "pending",
+	}).Get(ctx, nil)
 	if err != nil {
-		return &models.ValidatePaymentResult{
-			Success:  false,
-			Error:    err.Error(),
-			CanRetry: true,
-		}, nil
+		logger.Error("Failed to update order status", "error", err)
 	}
-	return &result, nil
-}
 
-func confirmBooking(ctx workflow.Context, orderID string, seatIDs []string) (*models.ConfirmBookingResult, error) {
-	var result models.ConfirmBookingResult
-	err := workflow.ExecuteActivity(ctx, activities.ConfirmBooking, orderID, seatIDs).Get(ctx, &result)
-	return &result, err
-}
+	// Main workflow loop
+	for {
+		selector := workflow.NewSelector(ctx)
 
-func buildOrder(state *models.BookingWorkflowState, input models.BookingWorkflowInput) *models.Order {
-	return &models.Order{
-		ID:              input.OrderID,
-		FlightID:        input.FlightID,
-		CustomerEmail:   input.CustomerEmail,
-		CustomerName:    input.CustomerName,
-		Seats:           state.SeatIDs,
-		Status:          state.Status,
-		TotalAmount:     state.TotalAmount,
-		PaymentAttempts: state.PaymentAttempts,
-		SeatHoldExpiry:  state.SeatHoldExpiry,
-		FailureReason:   state.FailureReason,
+		// Handle seat selection signal
+		selector.AddReceive(seatsSelectedCh, func(c workflow.ReceiveChannel, more bool) {
+			var signal SeatsSelectedSignal
+			c.Receive(ctx, &signal)
+			logger.Info("Seats selected", "seatCount", len(signal.SeatIDs))
+
+			seatsSelected = true
+			reservationExpiry = signal.ExpiresAt
+
+			// Update status
+			workflow.ExecuteActivity(ctx, "UpdateOrderStatus", activities.UpdateOrderStatusInput{
+				OrderID: input.OrderID,
+				Status:  "seats_selected",
+			})
+		})
+
+		// Handle payment submission signal
+		selector.AddReceive(paymentSubmittedCh, func(c workflow.ReceiveChannel, more bool) {
+			var signal PaymentSubmittedSignal
+			c.Receive(ctx, &signal)
+			logger.Info("Payment submitted", "attempt", paymentAttempts+1)
+
+			if !seatsSelected {
+				logger.Warn("Payment submitted before seats selected")
+				return
+			}
+
+			// Check if reservation expired
+			if workflow.Now(ctx).After(reservationExpiry) {
+				logger.Info("Reservation expired before payment")
+				workflow.ExecuteActivity(ctx, "ReleaseSeats", activities.ReleaseSeatsInput{
+					OrderID: input.OrderID,
+					Reason:  "expired",
+				})
+				return
+			}
+
+			paymentAttempts++
+
+			// Update status to processing
+			workflow.ExecuteActivity(ctx, "UpdateOrderStatus", activities.UpdateOrderStatusInput{
+				OrderID: input.OrderID,
+				Status:  "processing",
+			})
+
+			// Validate payment
+			var result activities.ValidatePaymentOutput
+			err := workflow.ExecuteActivity(paymentCtx, "ValidatePayment", activities.ValidatePaymentInput{
+				OrderID:     input.OrderID,
+				PaymentCode: signal.PaymentCode,
+				Attempt:     paymentAttempts,
+			}).Get(ctx, &result)
+
+			if err != nil {
+				logger.Error("Payment activity failed", "error", err)
+				return
+			}
+
+			if result.Success {
+				logger.Info("Payment successful!", "transactionId", result.TransactionID)
+
+				// Send confirmation
+				workflow.ExecuteActivity(ctx, "SendConfirmation", activities.SendConfirmationInput{
+					OrderID:       input.OrderID,
+					CustomerEmail: input.CustomerEmail,
+					CustomerName:  input.CustomerName,
+					TransactionID: result.TransactionID,
+				})
+			} else {
+				logger.Info("Payment failed", "attempt", paymentAttempts, "maxAttempts", MaxPaymentAttempts)
+
+				if paymentAttempts >= MaxPaymentAttempts {
+					// Max attempts reached - fail order
+					workflow.ExecuteActivity(ctx, "ReleaseSeats", activities.ReleaseSeatsInput{
+						OrderID: input.OrderID,
+						Reason:  "payment_failed",
+					})
+				} else {
+					// Allow retry
+					workflow.ExecuteActivity(ctx, "UpdateOrderStatus", activities.UpdateOrderStatusInput{
+						OrderID: input.OrderID,
+						Status:  "awaiting_payment",
+					})
+				}
+			}
+		})
+
+		// Timeout for seat hold expiry
+		if seatsSelected && !reservationExpiry.IsZero() {
+			timeUntilExpiry := reservationExpiry.Sub(workflow.Now(ctx))
+			if timeUntilExpiry > 0 {
+				selector.AddFuture(workflow.NewTimer(ctx, timeUntilExpiry), func(f workflow.Future) {
+					logger.Info("Reservation timer expired")
+
+					// Check if order is still in progress
+					var expired bool
+					workflow.ExecuteActivity(ctx, "CheckReservationExpiry", activities.CheckReservationExpiryInput{
+						OrderID: input.OrderID,
+					}).Get(ctx, &expired)
+
+					if expired {
+						workflow.ExecuteActivity(ctx, "ReleaseSeats", activities.ReleaseSeatsInput{
+							OrderID: input.OrderID,
+							Reason:  "expired",
+						})
+					}
+				})
+			}
+		}
+
+		selector.Select(ctx)
+
+		// Check for completion conditions
+		status, _ := getOrderStatus(ctx, input.OrderID)
+		if status == "confirmed" {
+			return &BookingWorkflowResult{
+				Success: true,
+			}, nil
+		}
+		if status == "failed" || status == "cancelled" || status == "expired" {
+			return &BookingWorkflowResult{
+				Success:       false,
+				FailureReason: string(status),
+			}, nil
+		}
+
+		// Check for context cancellation
+		if ctx.Err() != nil {
+			// Release seats on cancellation
+			workflow.ExecuteActivity(ctx, "ReleaseSeats", activities.ReleaseSeatsInput{
+				OrderID: input.OrderID,
+				Reason:  "cancelled",
+			})
+			return &BookingWorkflowResult{
+				Success:       false,
+				FailureReason: "cancelled",
+			}, nil
+		}
 	}
 }
 
+func getOrderStatus(ctx workflow.Context, orderID string) (string, error) {
+	// This is a simplified check - in production you'd query the database
+	// For now, we rely on the workflow state
+	return "in_progress", nil
+}

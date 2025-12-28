@@ -2,244 +2,287 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/cx-tal-miterani/flight-booking-system/shared/models"
+	"github.com/cx-tal-miterani/flight-booking-system/api-server/internal/database"
 	"github.com/google/uuid"
 	"go.temporal.io/sdk/client"
 )
 
-const (
-	TaskQueue = "flight-booking-queue"
-)
+// Service defines the interface for business logic
+type Service interface {
+	// Flights
+	GetFlights(ctx context.Context) ([]database.Flight, error)
+	GetFlight(ctx context.Context, id string) (*database.Flight, error)
+	GetFlightSeats(ctx context.Context, flightID string) ([]database.Seat, error)
 
-// BookingService defines the booking service interface
-type BookingService interface {
-	GetFlights(ctx context.Context) []*models.Flight
-	GetFlight(ctx context.Context, flightID string) (*models.Flight, error)
-	GetAvailableSeats(ctx context.Context, flightID string) ([]*models.Seat, error)
-	CreateOrder(ctx context.Context, req *models.CreateOrderRequest) (*models.Order, error)
-	GetOrderStatus(ctx context.Context, orderID string) (*models.OrderStatusResponse, error)
-	SelectSeats(ctx context.Context, orderID string, seatIDs []string) error
-	SubmitPayment(ctx context.Context, orderID string, paymentCode string) error
+	// Orders
+	CreateOrder(ctx context.Context, req CreateOrderRequest) (*database.Order, error)
+	GetOrder(ctx context.Context, id string) (*OrderStatusResponse, error)
+	SelectSeats(ctx context.Context, orderID string, seatIDs []string) (*OrderStatusResponse, error)
+	SubmitPayment(ctx context.Context, orderID string, paymentCode string) (*OrderStatusResponse, error)
 	CancelOrder(ctx context.Context, orderID string) error
-	RefreshTimer(ctx context.Context, orderID string) error
 }
 
-// bookingServiceImpl implements BookingService
-type bookingServiceImpl struct {
+// CreateOrderRequest represents a request to create an order
+type CreateOrderRequest struct {
+	FlightID      string `json:"flightId"`
+	CustomerName  string `json:"customerName"`
+	CustomerEmail string `json:"customerEmail"`
+}
+
+// OrderStatusResponse represents the response for order status
+type OrderStatusResponse struct {
+	Order            *database.Order `json:"order"`
+	RemainingSeconds int             `json:"remainingSeconds"`
+}
+
+// BookingService implements the Service interface
+type BookingService struct {
+	repo           *database.Repository
 	temporalClient client.Client
-	flights        map[string]*models.Flight
 }
 
-// NewBookingService creates a new BookingService
-func NewBookingService(temporalClient client.Client) BookingService {
-	svc := &bookingServiceImpl{
+// NewBookingService creates a new booking service
+func NewBookingService(repo *database.Repository, temporalClient client.Client) *BookingService {
+	return &BookingService{
+		repo:           repo,
 		temporalClient: temporalClient,
-		flights:        make(map[string]*models.Flight),
-	}
-	svc.initializeSampleFlights()
-	return svc
-}
-
-func (s *bookingServiceImpl) initializeSampleFlights() {
-	now := time.Now()
-	flights := []*models.Flight{
-		{
-			ID:             "FL001",
-			FlightNumber:   "AA123",
-			Origin:         "New York (JFK)",
-			Destination:    "Los Angeles (LAX)",
-			DepartureTime:  now.Add(24 * time.Hour),
-			ArrivalTime:    now.Add(30 * time.Hour),
-			TotalSeats:     180,
-			AvailableSeats: 180,
-			PricePerSeat:   150.00,
-		},
-		{
-			ID:             "FL002",
-			FlightNumber:   "UA456",
-			Origin:         "Chicago (ORD)",
-			Destination:    "Miami (MIA)",
-			DepartureTime:  now.Add(48 * time.Hour),
-			ArrivalTime:    now.Add(52 * time.Hour),
-			TotalSeats:     150,
-			AvailableSeats: 150,
-			PricePerSeat:   200.00,
-		},
-		{
-			ID:             "FL003",
-			FlightNumber:   "DL789",
-			Origin:         "San Francisco (SFO)",
-			Destination:    "Seattle (SEA)",
-			DepartureTime:  now.Add(12 * time.Hour),
-			ArrivalTime:    now.Add(14 * time.Hour),
-			TotalSeats:     210,
-			AvailableSeats: 210,
-			PricePerSeat:   120.00,
-		},
-	}
-
-	for _, f := range flights {
-		s.flights[f.ID] = f
 	}
 }
 
-func (s *bookingServiceImpl) GetFlights(ctx context.Context) []*models.Flight {
-	flights := make([]*models.Flight, 0, len(s.flights))
-	for _, f := range s.flights {
-		flights = append(flights, f)
-	}
-	return flights
+// GetFlights returns all available flights
+func (s *BookingService) GetFlights(ctx context.Context) ([]database.Flight, error) {
+	return s.repo.GetAllFlights(ctx)
 }
 
-func (s *bookingServiceImpl) GetFlight(ctx context.Context, flightID string) (*models.Flight, error) {
-	flight, ok := s.flights[flightID]
-	if !ok {
-		return nil, fmt.Errorf("flight not found: %s", flightID)
+// GetFlight returns a flight by ID
+func (s *BookingService) GetFlight(ctx context.Context, id string) (*database.Flight, error) {
+	flightID, err := uuid.Parse(id)
+	if err != nil {
+		return nil, fmt.Errorf("invalid flight ID: %w", err)
 	}
-	return flight, nil
+	return s.repo.GetFlightByID(ctx, flightID)
 }
 
-func (s *bookingServiceImpl) GetAvailableSeats(ctx context.Context, flightID string) ([]*models.Seat, error) {
-	flight, ok := s.flights[flightID]
-	if !ok {
-		return nil, fmt.Errorf("flight not found: %s", flightID)
+// GetFlightSeats returns seats for a flight
+func (s *BookingService) GetFlightSeats(ctx context.Context, flightID string) ([]database.Seat, error) {
+	id, err := uuid.Parse(flightID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid flight ID: %w", err)
 	}
-
-	// Generate seat list (this would come from the worker/database in production)
-	columns := []string{"A", "B", "C", "D", "E", "F"}
-	rows := flight.TotalSeats / len(columns)
-
-	seats := make([]*models.Seat, 0, flight.TotalSeats)
-	for row := 1; row <= rows; row++ {
-		for _, col := range columns {
-			seatID := fmt.Sprintf("%s-%d%s", flightID, row, col)
-			seats = append(seats, &models.Seat{
-				ID:       seatID,
-				FlightID: flightID,
-				Row:      row,
-				Column:   col,
-				Class:    models.SeatClassEconomy,
-				Status:   models.SeatStatusAvailable,
-				Price:    flight.PricePerSeat,
-			})
-		}
-	}
-	return seats, nil
+	return s.repo.GetFlightSeats(ctx, id)
 }
 
-func (s *bookingServiceImpl) CreateOrder(ctx context.Context, req *models.CreateOrderRequest) (*models.Order, error) {
-	// Validate flight exists
-	if _, ok := s.flights[req.FlightID]; !ok {
-		return nil, fmt.Errorf("flight not found: %s", req.FlightID)
+// CreateOrder creates a new booking order and starts the Temporal workflow
+func (s *BookingService) CreateOrder(ctx context.Context, req CreateOrderRequest) (*database.Order, error) {
+	flightID, err := uuid.Parse(req.FlightID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid flight ID: %w", err)
 	}
 
-	// Generate order ID
-	orderID := uuid.New().String()[:8]
+	// Verify flight exists
+	_, err = s.repo.GetFlightByID(ctx, flightID)
+	if err != nil {
+		return nil, fmt.Errorf("flight not found: %w", err)
+	}
 
-	// Create workflow input
-	input := models.BookingWorkflowInput{
-		OrderID:       orderID,
-		FlightID:      req.FlightID,
-		CustomerEmail: req.CustomerEmail,
+	// Create order
+	order := &database.Order{
+		ID:            uuid.New(),
+		FlightID:      flightID,
 		CustomerName:  req.CustomerName,
+		CustomerEmail: req.CustomerEmail,
+		Status:        database.OrderStatusPending,
 	}
 
-	// Start the booking workflow
+	// Start Temporal workflow
 	workflowOptions := client.StartWorkflowOptions{
-		ID:        "booking-" + orderID,
-		TaskQueue: TaskQueue,
+		ID:        fmt.Sprintf("booking-%s", order.ID.String()),
+		TaskQueue: "flight-booking-queue",
 	}
 
-	_, err := s.temporalClient.ExecuteWorkflow(ctx, workflowOptions, "BookingWorkflow", input)
+	workflowInput := map[string]interface{}{
+		"orderId":       order.ID.String(),
+		"flightId":      flightID.String(),
+		"customerName":  req.CustomerName,
+		"customerEmail": req.CustomerEmail,
+	}
+
+	we, err := s.temporalClient.ExecuteWorkflow(ctx, workflowOptions, "BookingWorkflow", workflowInput)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start workflow: %w", err)
 	}
 
-	// Return initial order state
-	order := &models.Order{
-		ID:            orderID,
-		FlightID:      req.FlightID,
-		CustomerEmail: req.CustomerEmail,
-		CustomerName:  req.CustomerName,
-		Status:        models.OrderStatusPending,
-		CreatedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
+	workflowID := we.GetID()
+	runID := we.GetRunID()
+	order.WorkflowID = &workflowID
+	order.WorkflowRunID = &runID
+
+	// Save order to database
+	if err := s.repo.CreateOrder(ctx, order); err != nil {
+		return nil, fmt.Errorf("failed to create order: %w", err)
 	}
 
 	return order, nil
 }
 
-func (s *bookingServiceImpl) GetOrderStatus(ctx context.Context, orderID string) (*models.OrderStatusResponse, error) {
-	workflowID := "booking-" + orderID
-
-	// Query the workflow for current state
-	response, err := s.temporalClient.QueryWorkflow(ctx, workflowID, "", models.QueryGetState)
+// GetOrder returns order status
+func (s *BookingService) GetOrder(ctx context.Context, id string) (*OrderStatusResponse, error) {
+	orderID, err := uuid.Parse(id)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query workflow: %w", err)
+		return nil, fmt.Errorf("invalid order ID: %w", err)
 	}
 
-	var state models.BookingWorkflowState
-	if err := response.Get(&state); err != nil {
-		return nil, fmt.Errorf("failed to decode workflow state: %w", err)
+	order, err := s.repo.GetOrderByID(ctx, orderID)
+	if err != nil {
+		return nil, err
 	}
 
-	// Build order from state
-	order := &models.Order{
-		ID:              orderID,
-		Seats:           state.SeatIDs,
-		Status:          state.Status,
-		TotalAmount:     state.TotalAmount,
-		PaymentAttempts: state.PaymentAttempts,
-		SeatHoldExpiry:  state.SeatHoldExpiry,
-		FailureReason:   state.FailureReason,
-		UpdatedAt:       state.LastUpdated,
-	}
+	remaining, _ := s.repo.GetOrderRemainingSeconds(ctx, orderID)
 
-	// Calculate remaining time
-	var remainingSeconds int
-	if !state.SeatHoldExpiry.IsZero() && state.Status == models.OrderStatusSeatsSelected {
-		remaining := time.Until(state.SeatHoldExpiry)
-		if remaining > 0 {
-			remainingSeconds = int(remaining.Seconds())
-		}
-	}
-
-	return &models.OrderStatusResponse{
+	return &OrderStatusResponse{
 		Order:            order,
-		RemainingSeconds: remainingSeconds,
+		RemainingSeconds: remaining,
 	}, nil
 }
 
-func (s *bookingServiceImpl) SelectSeats(ctx context.Context, orderID string, seatIDs []string) error {
-	workflowID := "booking-" + orderID
-
-	signal := models.SelectSeatsSignal{
-		SeatIDs: seatIDs,
+// SelectSeats selects seats for an order
+func (s *BookingService) SelectSeats(ctx context.Context, orderID string, seatIDs []string) (*OrderStatusResponse, error) {
+	oid, err := uuid.Parse(orderID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid order ID: %w", err)
 	}
 
-	return s.temporalClient.SignalWorkflow(ctx, workflowID, "", models.SignalSelectSeats, signal)
-}
-
-func (s *bookingServiceImpl) SubmitPayment(ctx context.Context, orderID string, paymentCode string) error {
-	workflowID := "booking-" + orderID
-
-	signal := models.SubmitPaymentSignal{
-		PaymentCode: paymentCode,
+	order, err := s.repo.GetOrderByID(ctx, oid)
+	if err != nil {
+		return nil, err
 	}
 
-	return s.temporalClient.SignalWorkflow(ctx, workflowID, "", models.SignalSubmitPayment, signal)
+	// Parse seat IDs (they come as "flightID-seatNumber" format from frontend)
+	var seatUUIDs []uuid.UUID
+	var seatNumbers []string
+	
+	for _, sid := range seatIDs {
+		// Try parsing as UUID first
+		if id, err := uuid.Parse(sid); err == nil {
+			seatUUIDs = append(seatUUIDs, id)
+		} else {
+			// Extract seat number from "flightID-seatNumber" format
+			seatNumbers = append(seatNumbers, extractSeatNumber(sid))
+		}
+	}
+
+	// If we have seat numbers, convert to UUIDs
+	if len(seatNumbers) > 0 {
+		ids, err := s.repo.GetSeatIDsByFlightAndNumbers(ctx, order.FlightID, seatNumbers)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get seat IDs: %w", err)
+		}
+		seatUUIDs = append(seatUUIDs, ids...)
+	}
+
+	if len(seatUUIDs) == 0 {
+		return nil, errors.New("no valid seats selected")
+	}
+
+	// Hold seats (this refreshes the 15-minute timer)
+	if err := s.repo.HoldSeats(ctx, oid, seatUUIDs); err != nil {
+		return nil, fmt.Errorf("failed to hold seats: %w", err)
+	}
+
+	// Update order seats
+	if err := s.repo.SetOrderSeats(ctx, oid, seatUUIDs); err != nil {
+		return nil, fmt.Errorf("failed to set order seats: %w", err)
+	}
+
+	// Signal workflow about seat selection
+	if order.WorkflowID != nil {
+		err = s.temporalClient.SignalWorkflow(ctx, *order.WorkflowID, "", "seats-selected", map[string]interface{}{
+			"seatIds":   seatIDs,
+			"expiresAt": time.Now().Add(15 * time.Minute),
+		})
+		if err != nil {
+			// Log but don't fail - order is already updated
+			fmt.Printf("Warning: failed to signal workflow: %v\n", err)
+		}
+	}
+
+	return s.GetOrder(ctx, orderID)
 }
 
-func (s *bookingServiceImpl) CancelOrder(ctx context.Context, orderID string) error {
-	workflowID := "booking-" + orderID
-	return s.temporalClient.SignalWorkflow(ctx, workflowID, "", models.SignalCancelOrder, nil)
+// SubmitPayment submits payment for an order
+func (s *BookingService) SubmitPayment(ctx context.Context, orderID string, paymentCode string) (*OrderStatusResponse, error) {
+	oid, err := uuid.Parse(orderID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid order ID: %w", err)
+	}
+
+	order, err := s.repo.GetOrderByID(ctx, oid)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if reservation expired
+	remaining, _ := s.repo.GetOrderRemainingSeconds(ctx, oid)
+	if remaining <= 0 {
+		s.repo.UpdateOrderStatus(ctx, oid, database.OrderStatusExpired)
+		s.repo.ReleaseSeats(ctx, oid)
+		return nil, database.ErrOrderExpired
+	}
+
+	// Update status to processing
+	s.repo.UpdateOrderStatus(ctx, oid, database.OrderStatusProcessing)
+
+	// Signal workflow to process payment
+	if order.WorkflowID != nil {
+		err = s.temporalClient.SignalWorkflow(ctx, *order.WorkflowID, "", "payment-submitted", map[string]interface{}{
+			"paymentCode": paymentCode,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to signal payment: %w", err)
+		}
+	}
+
+	return s.GetOrder(ctx, orderID)
 }
 
-func (s *bookingServiceImpl) RefreshTimer(ctx context.Context, orderID string) error {
-	workflowID := "booking-" + orderID
-	return s.temporalClient.SignalWorkflow(ctx, workflowID, "", models.SignalRefreshTimer, nil)
+// CancelOrder cancels an order
+func (s *BookingService) CancelOrder(ctx context.Context, orderID string) error {
+	oid, err := uuid.Parse(orderID)
+	if err != nil {
+		return fmt.Errorf("invalid order ID: %w", err)
+	}
+
+	order, err := s.repo.GetOrderByID(ctx, oid)
+	if err != nil {
+		return err
+	}
+
+	// Release seats
+	s.repo.ReleaseSeats(ctx, oid)
+
+	// Update status
+	s.repo.UpdateOrderStatus(ctx, oid, database.OrderStatusCancelled)
+
+	// Cancel workflow
+	if order.WorkflowID != nil {
+		s.temporalClient.CancelWorkflow(ctx, *order.WorkflowID, "")
+	}
+
+	return nil
 }
 
+// extractSeatNumber extracts seat number from "flightID-seatNumber" format
+func extractSeatNumber(seatID string) string {
+	// Handle format like "550e8400-e29b-41d4-a716-446655440001-1A"
+	// or just "1A"
+	for i := len(seatID) - 1; i >= 0; i-- {
+		if seatID[i] == '-' {
+			return seatID[i+1:]
+		}
+	}
+	return seatID
+}

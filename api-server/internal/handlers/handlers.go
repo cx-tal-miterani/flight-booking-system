@@ -2,27 +2,25 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
-	"time"
 
+	"github.com/cx-tal-miterani/flight-booking-system/api-server/internal/database"
 	"github.com/cx-tal-miterani/flight-booking-system/api-server/internal/service"
-	"github.com/cx-tal-miterani/flight-booking-system/shared/models"
-	"github.com/go-chi/chi/v5"
+	"github.com/gorilla/mux"
 )
 
-// Handler contains HTTP handlers for the API
+// Handler contains all HTTP handlers
 type Handler struct {
-	bookingService service.BookingService
+	service service.Service
 }
 
-// NewHandler creates a new Handler instance
-func NewHandler(bookingService service.BookingService) *Handler {
-	return &Handler{
-		bookingService: bookingService,
-	}
+// NewHandler creates a new handler
+func NewHandler(svc service.Service) *Handler {
+	return &Handler{service: svc}
 }
 
-// Response helpers
+// respondJSON sends a JSON response
 func respondJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -31,22 +29,33 @@ func respondJSON(w http.ResponseWriter, status int, data interface{}) {
 	}
 }
 
+// respondError sends an error response
 func respondError(w http.ResponseWriter, status int, message string) {
 	respondJSON(w, status, map[string]string{"error": message})
 }
 
 // GetFlights handles GET /api/flights
 func (h *Handler) GetFlights(w http.ResponseWriter, r *http.Request) {
-	flights := h.bookingService.GetFlights(r.Context())
+	flights, err := h.service.GetFlights(r.Context())
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, flights)
 }
 
 // GetFlight handles GET /api/flights/{id}
 func (h *Handler) GetFlight(w http.ResponseWriter, r *http.Request) {
-	flightID := chi.URLParam(r, "id")
-	flight, err := h.bookingService.GetFlight(r.Context(), flightID)
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	flight, err := h.service.GetFlight(r.Context(), id)
 	if err != nil {
-		respondError(w, http.StatusNotFound, "Flight not found")
+		if errors.Is(err, database.ErrNotFound) {
+			respondError(w, http.StatusNotFound, "Flight not found")
+			return
+		}
+		respondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	respondJSON(w, http.StatusOK, flight)
@@ -54,10 +63,12 @@ func (h *Handler) GetFlight(w http.ResponseWriter, r *http.Request) {
 
 // GetFlightSeats handles GET /api/flights/{id}/seats
 func (h *Handler) GetFlightSeats(w http.ResponseWriter, r *http.Request) {
-	flightID := chi.URLParam(r, "id")
-	seats, err := h.bookingService.GetAvailableSeats(r.Context(), flightID)
+	vars := mux.Vars(r)
+	flightID := vars["id"]
+
+	seats, err := h.service.GetFlightSeats(r.Context(), flightID)
 	if err != nil {
-		respondError(w, http.StatusNotFound, "Flight not found")
+		respondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	respondJSON(w, http.StatusOK, seats)
@@ -65,148 +76,121 @@ func (h *Handler) GetFlightSeats(w http.ResponseWriter, r *http.Request) {
 
 // CreateOrder handles POST /api/orders
 func (h *Handler) CreateOrder(w http.ResponseWriter, r *http.Request) {
-	var req models.CreateOrderRequest
+	var req service.CreateOrderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	// Validate request
-	if req.FlightID == "" {
-		respondError(w, http.StatusBadRequest, "Flight ID is required")
-		return
-	}
-	if req.CustomerEmail == "" {
-		respondError(w, http.StatusBadRequest, "Customer email is required")
-		return
-	}
-	if req.CustomerName == "" {
-		respondError(w, http.StatusBadRequest, "Customer name is required")
+	if req.FlightID == "" || req.CustomerName == "" || req.CustomerEmail == "" {
+		respondError(w, http.StatusBadRequest, "Missing required fields")
 		return
 	}
 
-	order, err := h.bookingService.CreateOrder(r.Context(), &req)
+	order, err := h.service.CreateOrder(r.Context(), req)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
 	respondJSON(w, http.StatusCreated, order)
 }
 
 // GetOrder handles GET /api/orders/{id}
 func (h *Handler) GetOrder(w http.ResponseWriter, r *http.Request) {
-	orderID := chi.URLParam(r, "id")
+	vars := mux.Vars(r)
+	id := vars["id"]
 
-	status, err := h.bookingService.GetOrderStatus(r.Context(), orderID)
+	status, err := h.service.GetOrder(r.Context(), id)
 	if err != nil {
-		respondError(w, http.StatusNotFound, "Order not found")
+		if errors.Is(err, database.ErrNotFound) {
+			respondError(w, http.StatusNotFound, "Order not found")
+			return
+		}
+		respondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	// Calculate remaining seconds
-	if !status.Order.SeatHoldExpiry.IsZero() && status.Order.Status == models.OrderStatusSeatsSelected {
-		remaining := time.Until(status.Order.SeatHoldExpiry)
-		if remaining > 0 {
-			status.RemainingSeconds = int(remaining.Seconds())
-		}
-	}
-
 	respondJSON(w, http.StatusOK, status)
+}
+
+// SelectSeatsRequest represents the request body for seat selection
+type SelectSeatsRequest struct {
+	SeatIDs []string `json:"seatIds"`
 }
 
 // SelectSeats handles POST /api/orders/{id}/seats
 func (h *Handler) SelectSeats(w http.ResponseWriter, r *http.Request) {
-	orderID := chi.URLParam(r, "id")
+	vars := mux.Vars(r)
+	orderID := vars["id"]
 
-	var req models.SelectSeatsRequest
+	var req SelectSeatsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
 	if len(req.SeatIDs) == 0 {
-		respondError(w, http.StatusBadRequest, "At least one seat must be selected")
+		respondError(w, http.StatusBadRequest, "No seats selected")
 		return
 	}
 
-	err := h.bookingService.SelectSeats(r.Context(), orderID, req.SeatIDs)
+	status, err := h.service.SelectSeats(r.Context(), orderID, req.SeatIDs)
 	if err != nil {
-		respondError(w, http.StatusBadRequest, err.Error())
+		if errors.Is(err, database.ErrSeatNotAvailable) {
+			respondError(w, http.StatusConflict, "One or more seats are not available")
+			return
+		}
+		respondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	// Return updated order status
-	status, _ := h.bookingService.GetOrderStatus(r.Context(), orderID)
 	respondJSON(w, http.StatusOK, status)
+}
+
+// PaymentRequest represents the request body for payment
+type PaymentRequest struct {
+	PaymentCode string `json:"paymentCode"`
 }
 
 // SubmitPayment handles POST /api/orders/{id}/pay
 func (h *Handler) SubmitPayment(w http.ResponseWriter, r *http.Request) {
-	orderID := chi.URLParam(r, "id")
+	vars := mux.Vars(r)
+	orderID := vars["id"]
 
-	var req models.PaymentRequest
+	var req PaymentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	// Validate payment code format
 	if len(req.PaymentCode) != 5 {
-		respondError(w, http.StatusBadRequest, "Payment code must be exactly 5 digits")
+		respondError(w, http.StatusBadRequest, "Payment code must be 5 digits")
 		return
 	}
-	for _, c := range req.PaymentCode {
-		if c < '0' || c > '9' {
-			respondError(w, http.StatusBadRequest, "Payment code must contain only digits")
+
+	status, err := h.service.SubmitPayment(r.Context(), orderID, req.PaymentCode)
+	if err != nil {
+		if errors.Is(err, database.ErrOrderExpired) {
+			respondError(w, http.StatusGone, "Reservation has expired")
 			return
 		}
-	}
-
-	err := h.bookingService.SubmitPayment(r.Context(), orderID, req.PaymentCode)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, err.Error())
+		respondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	// Wait a bit for workflow to process, then return status
-	time.Sleep(100 * time.Millisecond)
-	status, _ := h.bookingService.GetOrderStatus(r.Context(), orderID)
 	respondJSON(w, http.StatusOK, status)
 }
 
 // CancelOrder handles DELETE /api/orders/{id}
 func (h *Handler) CancelOrder(w http.ResponseWriter, r *http.Request) {
-	orderID := chi.URLParam(r, "id")
+	vars := mux.Vars(r)
+	orderID := vars["id"]
 
-	err := h.bookingService.CancelOrder(r.Context(), orderID)
+	err := h.service.CancelOrder(r.Context(), orderID)
 	if err != nil {
-		respondError(w, http.StatusBadRequest, err.Error())
+		if errors.Is(err, database.ErrNotFound) {
+			respondError(w, http.StatusNotFound, "Order not found")
+			return
+		}
+		respondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	respondJSON(w, http.StatusOK, map[string]string{"message": "Order cancelled"})
+	w.WriteHeader(http.StatusNoContent)
 }
-
-// RefreshTimer handles POST /api/orders/{id}/refresh
-func (h *Handler) RefreshTimer(w http.ResponseWriter, r *http.Request) {
-	orderID := chi.URLParam(r, "id")
-
-	err := h.bookingService.RefreshTimer(r.Context(), orderID)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	status, _ := h.bookingService.GetOrderStatus(r.Context(), orderID)
-	respondJSON(w, http.StatusOK, status)
-}
-
-// HealthCheck handles GET /health
-func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, http.StatusOK, map[string]string{
-		"status": "healthy",
-		"time":   time.Now().Format(time.RFC3339),
-	})
-}
-

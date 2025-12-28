@@ -1,128 +1,239 @@
-# Flight Booking System - Temporal Architecture
+# Flight Booking System
 
-A microservices-based flight booking system using Go, Temporal, and React.
+A microservice-based flight booking system built with **Go**, **React**, **Temporal**, and **PostgreSQL**.
 
 ## Architecture
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────────┐
-│   React     │────▶│  API Server │────▶│ Temporal Server │
-│   Frontend  │◀────│    (Go)     │◀────│                 │
-└─────────────┘     └─────────────┘     └────────┬────────┘
-                                                 │
-                                        ┌────────▼────────┐
-                                        │ Temporal Worker │
-                                        │      (Go)       │
-                                        └─────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                              Frontend                                │
+│                         (React + Vite)                              │
+│                           Port: 3000                                │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                            API Server                                │
+│                          (Go + Gorilla)                              │
+│                           Port: 8081                                 │
+└─────────────────────────────────────────────────────────────────────┘
+                    │                               │
+                    ▼                               ▼
+┌───────────────────────────────┐   ┌─────────────────────────────────┐
+│         PostgreSQL            │   │           Temporal              │
+│         Port: 5432            │   │           Port: 7233            │
+│   (Flights, Seats, Orders)    │   │    (Workflow Orchestration)     │
+└───────────────────────────────┘   └─────────────────────────────────┘
+                                                    │
+                                                    ▼
+                                    ┌─────────────────────────────────┐
+                                    │       Temporal Worker           │
+                                    │    (Booking Workflows)          │
+                                    └─────────────────────────────────┘
 ```
 
-## Services
+## Features
 
-- **api-server**: RESTful API for flight booking operations
-- **temporal-worker**: Temporal workflow and activity workers
-- **frontend**: React-based booking interface
+- ✅ **Flight Listing**: Browse available flights with seat availability
+- ✅ **Seat Selection**: Interactive seat map with real-time availability
+- ✅ **15-Minute Timer**: Seat reservation hold with countdown (refreshes on changes)
+- ✅ **5-Digit Payment**: Secure payment code validation
+- ✅ **85% Success Rate**: Simulated payment validation with retry logic
+- ✅ **3 Retry Attempts**: Automatic retry handling for failed payments
+- ✅ **Real-time Updates**: Polling for order status changes
+- ✅ **Workflow Orchestration**: Temporal-based booking workflow
 
-## Business Logic
+## Tech Stack
 
-- **Seat Reservation**: 15-minute hold with auto-release, refreshable timer
-- **Payment Validation**: 5-digit code, 10s timeout, 3 retries, 15% failure simulation
-- **Order Management**: Status tracking, failure handling, confirmations
-
-## Prerequisites
-
-- Go 1.21+
-- Node.js 20+
-- Podman or Docker
-- Temporal CLI (for local development)
+| Component | Technology |
+|-----------|------------|
+| Backend | Go 1.21, Gorilla Mux |
+| Frontend | React 18, TypeScript, Vite, Tailwind CSS |
+| Database | PostgreSQL 16 |
+| Workflow Engine | Temporal |
+| UI Components | Radix UI, Shadcn-style |
+| Testing | Go: testify, Jest for React |
+| Containerization | Docker, Podman |
 
 ## Quick Start
 
-### Using Podman/Docker Compose
+### Prerequisites
+
+- Docker or Podman
+- Docker Compose
+- Go 1.21+ (for local development)
+- Node.js 20+ (for frontend development)
+
+### Run with Docker/Podman
 
 ```bash
 # Start all services
+docker-compose up -d
+
+# Or with Podman
 podman-compose up -d
 
-# Or with Docker
-docker compose up -d
+# View logs
+docker-compose logs -f
+
+# Stop services
+docker-compose down
 ```
 
-### Manual Development
+### Access the Application
+
+| Service | URL |
+|---------|-----|
+| Frontend | http://localhost:3000 |
+| API Server | http://localhost:8081 |
+| Temporal UI | http://localhost:8080 |
+| PostgreSQL | localhost:5432 |
+
+### Local Development
+
+#### Database Setup
 
 ```bash
-# Terminal 1: Start Temporal Server
-temporal server start-dev
+# Start PostgreSQL only
+docker-compose up -d postgres
 
-# Terminal 2: Start API Server
-cd api-server && go run ./cmd/server
-
-# Terminal 3: Start Temporal Worker
-cd temporal-worker && go run ./cmd/worker
-
-# Terminal 4: Start Frontend
-cd frontend && npm install && npm run dev
+# Or run PostgreSQL locally and apply migrations
+psql -U flightbooking -d flightbooking -f database/init/001_schema.sql
+psql -U flightbooking -d flightbooking -f database/init/002_seed_data.sql
 ```
 
-## API Endpoints
+#### API Server
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | /api/flights | List available flights |
-| POST | /api/orders | Create new booking order |
-| GET | /api/orders/:id | Get order status |
-| POST | /api/orders/:id/seats | Select/update seats |
-| POST | /api/orders/:id/pay | Submit payment code |
-| DELETE | /api/orders/:id | Cancel order |
+```bash
+cd api-server
+go mod download
+DATABASE_URL="postgres://flightbooking:flightbooking123@localhost:5432/flightbooking?sslmode=disable" \
+TEMPORAL_HOST="localhost:7233" \
+go run cmd/server/main.go
+```
+
+#### Temporal Worker
+
+```bash
+cd temporal-worker
+go mod download
+DATABASE_URL="postgres://flightbooking:flightbooking123@localhost:5432/flightbooking?sslmode=disable" \
+TEMPORAL_HOST="localhost:7233" \
+go run cmd/worker/main.go
+```
+
+#### Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
 ## Testing
 
+### Go Tests
+
 ```bash
-# Run all tests
-make test
+# API Server
+cd api-server
+go test -v ./...
 
-# Run with coverage
-make test-coverage
-
-# Run specific service tests
-cd api-server && go test ./... -v
-cd temporal-worker && go test ./... -v
+# Temporal Worker
+cd temporal-worker
+go test -v ./...
 ```
 
-## Project Structure
+### Frontend Tests
 
+```bash
+cd frontend
+npm test
+npm test -- --coverage
 ```
-flight-booking-system/
-├── api-server/           # REST API service
-│   ├── cmd/server/       # Entry point
-│   ├── internal/
-│   │   ├── handlers/     # HTTP handlers
-│   │   ├── service/      # Business logic
-│   │   └── repository/   # Data access
-│   └── Dockerfile
-├── temporal-worker/      # Temporal workers
-│   ├── cmd/worker/       # Entry point
-│   ├── internal/
-│   │   ├── workflows/    # Workflow definitions
-│   │   └── activities/   # Activity implementations
-│   └── Dockerfile
-├── shared/               # Shared code
-│   └── models/           # Common data models
-├── frontend/             # React application
-└── docker-compose.yml
-```
+
+## Database Schema
+
+### Tables
+
+| Table | Description |
+|-------|-------------|
+| `flights` | Flight information (number, origin, destination, times, pricing) |
+| `seats` | Seat details (row, column, class, status, price) |
+| `orders` | Booking orders (customer info, status, payment attempts) |
+| `order_seats` | Junction table for order-seat relationships |
+
+### Seat Statuses
+
+- `available` - Can be selected
+- `held` - Temporarily reserved (15-min hold)
+- `booked` - Permanently booked after payment
+
+### Order Statuses
+
+- `pending` - Order created
+- `seats_selected` - Seats held
+- `awaiting_payment` - Waiting for payment
+- `processing` - Payment being validated
+- `confirmed` - Payment successful
+- `failed` - Payment failed after 3 attempts
+- `cancelled` - Order cancelled by user
+- `expired` - Reservation timer expired
+
+## API Endpoints
+
+### Flights
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/flights` | List all available flights |
+| GET | `/api/flights/:id` | Get flight details |
+| GET | `/api/flights/:id/seats` | Get seats for a flight |
+
+### Orders
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/orders` | Create a new order |
+| GET | `/api/orders/:id` | Get order status |
+| POST | `/api/orders/:id/seats` | Select seats (starts/refreshes 15-min timer) |
+| POST | `/api/orders/:id/pay` | Submit payment code |
+| DELETE | `/api/orders/:id` | Cancel order |
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| API_PORT | 8080 | API server port |
-| TEMPORAL_HOST | localhost:7233 | Temporal server address |
-| TEMPORAL_NAMESPACE | default | Temporal namespace |
-| SEAT_HOLD_TIMEOUT | 15m | Seat reservation timeout |
-| PAYMENT_TIMEOUT | 10s | Payment validation timeout |
-| PAYMENT_RETRIES | 3 | Payment retry attempts |
+| `PORT` | 8081 | API server port |
+| `DATABASE_URL` | (see docker-compose) | PostgreSQL connection string |
+| `TEMPORAL_HOST` | localhost:7233 | Temporal server address |
+
+## Booking Flow
+
+```
+1. User selects flight
+       │
+       ▼
+2. User enters customer info → Order created → Workflow started
+       │
+       ▼
+3. User selects seats → 15-minute timer starts
+       │
+       ├── User modifies seats → Timer refreshes
+       │
+       ▼
+4. User enters 5-digit payment code
+       │
+       ▼
+5. Payment validation (10 seconds, 85% success)
+       │
+       ├── Success → Seats booked → Confirmation
+       │
+       └── Failure → Retry (up to 3 times)
+               │
+               └── 3 failures → Order failed → Seats released
+```
 
 ## License
 
 MIT
-
