@@ -255,9 +255,9 @@ func (s *BookingService) SelectSeats(ctx context.Context, orderID string, seatID
 
 	hub := websocket.GetHub()
 
-	// Broadcast released seats as available
+	// Broadcast released seats as available (use SeatsReleased, not OrderExpired)
 	if len(releasedSeats) > 0 {
-		hub.BroadcastOrderExpired(order.FlightID.String(), orderID, releasedSeats)
+		hub.BroadcastSeatsReleased(order.FlightID.String(), orderID, releasedSeats)
 	}
 
 	// Broadcast newly held seats
@@ -292,6 +292,29 @@ func (s *BookingService) SubmitPayment(ctx context.Context, orderID string, paym
 	order, err := s.repo.GetOrderByID(ctx, oid)
 	if err != nil {
 		return nil, err
+	}
+
+	// Check if order is in a terminal state
+	if order.Status == database.OrderStatusConfirmed ||
+		order.Status == database.OrderStatusFailed ||
+		order.Status == database.OrderStatusCancelled ||
+		order.Status == database.OrderStatusExpired {
+		return nil, fmt.Errorf("order is already in terminal state: %s", order.Status)
+	}
+
+	// Check if order is already processing (prevent double submission)
+	if order.Status == database.OrderStatusProcessing {
+		// Return current status without error - payment is in progress
+		return s.GetOrder(ctx, orderID)
+	}
+
+	// Check max payment attempts (3 max)
+	const maxAttempts = 3
+	if order.PaymentAttempts >= maxAttempts {
+		s.repo.UpdateOrderStatus(ctx, oid, database.OrderStatusFailed)
+		reason := "Maximum payment attempts exceeded"
+		s.repo.UpdateOrderPayment(ctx, oid, order.PaymentAttempts, &reason)
+		return nil, fmt.Errorf("maximum payment attempts (%d) exceeded", maxAttempts)
 	}
 
 	// Check if reservation expired

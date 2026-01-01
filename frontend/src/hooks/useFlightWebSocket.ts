@@ -5,7 +5,8 @@ export type WebSocketMessageType =
   | 'seats_updated'
   | 'seat_conflict'
   | 'order_completed'
-  | 'order_expired';
+  | 'order_expired'
+  | 'seats_released';
 
 export interface SeatUpdate {
   seatId: string;
@@ -29,6 +30,7 @@ interface UseFlightWebSocketOptions {
   onSeatConflict?: (seats: SeatUpdate[], message: string) => void;
   onOrderCompleted?: (orderId: string, seats: SeatUpdate[]) => void;
   onOrderExpired?: (orderId: string, seats: SeatUpdate[]) => void;
+  onSeatsReleased?: (orderId: string, seats: SeatUpdate[]) => void;
 }
 
 export function useFlightWebSocket({
@@ -38,6 +40,7 @@ export function useFlightWebSocket({
   onSeatConflict,
   onOrderCompleted,
   onOrderExpired,
+  onSeatsReleased,
 }: UseFlightWebSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
@@ -97,6 +100,12 @@ export function useFlightWebSocket({
             case 'order_expired':
               if (message.orderId && message.seats && onOrderExpired) {
                 onOrderExpired(message.orderId, message.seats);
+              }
+              break;
+
+            case 'seats_released':
+              if (message.orderId && message.seats && onSeatsReleased) {
+                onSeatsReleased(message.orderId, message.seats);
               }
               break;
           }

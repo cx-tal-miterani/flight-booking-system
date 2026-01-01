@@ -86,6 +86,8 @@ export function BookingPage() {
   }, [order?.id, flightId, selectedSeats, step, showSeatConflict]);
 
   const handleOrderExpired = useCallback((expiredOrderId: string, seatUpdates: SeatUpdate[]) => {
+    console.log('handleOrderExpired called:', { expiredOrderId, currentOrderId: order?.id, seatUpdates });
+    
     // Always refresh seats from server for accuracy
     if (flightId) {
       api.getFlightSeats(flightId).then(setSeats).catch(console.error);
@@ -93,6 +95,7 @@ export function BookingPage() {
     
     if (expiredOrderId === order?.id) {
       // OUR order expired - show failure!
+      console.log('OUR order expired - setting step to failed');
       setOrder((prev) => prev ? { ...prev, status: 'expired', failureReason: 'Reservation expired' } : prev);
       setStep('failed');
       if (flightId) {
@@ -104,6 +107,18 @@ export function BookingPage() {
     }
   }, [order?.id, flightId, showSeatsReleased]);
 
+  // Handle seats voluntarily released (NOT order expiry - just seat modification)
+  const handleSeatsReleased = useCallback((releasedOrderId: string, seatUpdates: SeatUpdate[]) => {
+    // Update seat status
+    setSeats((prevSeats) => applySeatUpdates(prevSeats, seatUpdates));
+    
+    // Only show notification to OTHER users
+    if (releasedOrderId !== order?.id) {
+      showSeatsReleased(seatUpdates.map((s) => s.seatId));
+    }
+    // For the owner: nothing special - they know they released the seats
+  }, [order?.id, showSeatsReleased]);
+
   // Connect to WebSocket for real-time updates
   const { isConnected } = useFlightWebSocket({
     flightId,
@@ -112,6 +127,7 @@ export function BookingPage() {
     onSeatConflict: handleSeatConflict,
     onOrderCompleted: handleOrderCompleted,
     onOrderExpired: handleOrderExpired,
+    onSeatsReleased: handleSeatsReleased,
   });
 
   // Restore session from localStorage on mount
@@ -235,13 +251,17 @@ export function BookingPage() {
   const checkOrderStatus = useCallback(async () => {
     if (!order?.id) return;
     
+    console.log('checkOrderStatus called for order:', order.id);
+    
     try {
       const status = await api.getOrderStatus(order.id);
+      console.log('checkOrderStatus response:', status.order.status, 'remaining:', status.remainingSeconds);
       setOrder(status.order);
       setRemainingSeconds(status.remainingSeconds);
       
       // Check for terminal states
       if (['confirmed', 'failed', 'cancelled', 'expired'].includes(status.order.status)) {
+        console.log('checkOrderStatus: Terminal state detected, setting step to', status.order.status === 'confirmed' ? 'confirmed' : 'failed');
         setStep(status.order.status === 'confirmed' ? 'confirmed' : 'failed');
         // Clear session on terminal state
         if (flightId) {
@@ -256,6 +276,7 @@ export function BookingPage() {
   // Handle local timer expiry - check with server if order expired
   useEffect(() => {
     if (remainingSeconds === 0 && order?.id && ['seats', 'payment'].includes(step)) {
+      console.log('Timer reached 0 - checking order status');
       // Timer reached 0, check with server if order expired
       checkOrderStatus();
     }
@@ -367,7 +388,8 @@ export function BookingPage() {
   };
 
   const handlePayment = async (paymentCode: string) => {
-    if (!order?.id) return;
+    // Prevent double submission
+    if (!order?.id || submitting) return;
 
     setSubmitting(true);
     setError(null);

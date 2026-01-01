@@ -18,6 +18,7 @@ const (
 	MessageTypeSeatConflict   MessageType = "seat_conflict"
 	MessageTypeOrderCompleted MessageType = "order_completed"
 	MessageTypeOrderExpired   MessageType = "order_expired"
+	MessageTypeSeatsReleased  MessageType = "seats_released" // When user voluntarily releases seats (not order expiry)
 )
 
 // SeatUpdate represents a seat status change
@@ -190,7 +191,7 @@ func (h *Hub) BroadcastOrderCompleted(flightID string, orderID string, seatIDs [
 	h.broadcast <- msg
 }
 
-// BroadcastOrderExpired notifies clients that an order expired
+// BroadcastOrderExpired notifies clients that an order expired (triggers failure UI for owner)
 func (h *Hub) BroadcastOrderExpired(flightID string, orderID string, seatIDs []string) {
 	seats := make([]SeatUpdate, len(seatIDs))
 	for i, seatID := range seatIDs {
@@ -206,6 +207,27 @@ func (h *Hub) BroadcastOrderExpired(flightID string, orderID string, seatIDs []s
 		OrderID:   orderID,
 		Seats:     seats,
 		Message:   "Reservation expired - seats are now available",
+		Timestamp: time.Now().UnixMilli(),
+	}
+	h.broadcast <- msg
+}
+
+// BroadcastSeatsReleased notifies clients that seats were voluntarily released (NOT order expiry)
+func (h *Hub) BroadcastSeatsReleased(flightID string, orderID string, seatIDs []string) {
+	seats := make([]SeatUpdate, len(seatIDs))
+	for i, seatID := range seatIDs {
+		seats[i] = SeatUpdate{
+			SeatID: seatID,
+			Status: "available",
+		}
+	}
+
+	msg := &Message{
+		Type:      MessageTypeSeatsReleased,
+		FlightID:  flightID,
+		OrderID:   orderID,
+		Seats:     seats,
+		Message:   "Seats released",
 		Timestamp: time.Now().UnixMilli(),
 	}
 	h.broadcast <- msg
