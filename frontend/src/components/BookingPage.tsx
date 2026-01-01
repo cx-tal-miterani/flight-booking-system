@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Check, X, Loader2, Plane, RefreshCw } from 'lucide-react';
+import { ArrowLeft, Check, X, Loader2, Plane, RefreshCw, Wifi, WifiOff } from 'lucide-react';
 import { api } from '../api';
 import type { Flight, Seat, Order, OrderStatus } from '../types';
 import { SeatMap } from './SeatMap';
@@ -12,6 +12,9 @@ import { Input } from './ui/input';
 import { Badge } from './ui/badge';
 import { Alert, AlertDescription } from './ui/alert';
 import { formatCurrency } from '../lib/utils';
+import { useFlightWebSocket, applySeatUpdates, SeatUpdate } from '../hooks/useFlightWebSocket';
+import { useSeatConflictToast, useSeatsReleasedToast } from './ui/toast';
+import { saveOrderSession, getOrderSession, clearOrderSession } from '../lib/orderSession';
 
 type BookingStep = 'customer' | 'seats' | 'payment' | 'confirmed' | 'failed';
 
@@ -20,6 +23,8 @@ const STEP_ORDER: BookingStep[] = ['customer', 'seats', 'payment', 'confirmed'];
 export function BookingPage() {
   const { flightId } = useParams<{ flightId: string }>();
   const navigate = useNavigate();
+  const showSeatConflict = useSeatConflictToast();
+  const showSeatsReleased = useSeatsReleasedToast();
   
   const [flight, setFlight] = useState<Flight | null>(null);
   const [seats, setSeats] = useState<Seat[]>([]);
@@ -30,12 +35,179 @@ export function BookingPage() {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showModifySeats, setShowModifySeats] = useState(false);
   const [customerInfo, setCustomerInfo] = useState({ name: '', email: '' });
+  const [restoringSession, setRestoringSession] = useState(true);
+  const sessionRestored = useRef(false);
 
-  // Fetch flight and seats
+  // WebSocket handlers for real-time updates
+  const handleSeatsUpdated = useCallback((updates: SeatUpdate[]) => {
+    setSeats((prevSeats) => applySeatUpdates(prevSeats, updates));
+    
+    // Check if any of our selected seats were taken by someone else
+    const takenSeats = updates.filter(
+      (u) => u.status === 'held' && selectedSeats.includes(u.seatId) && u.heldBy !== order?.id
+    );
+    
+    if (takenSeats.length > 0 && step === 'seats') {
+      // Remove taken seats from selection
+      setSelectedSeats((prev) => prev.filter((id) => !takenSeats.some((t) => t.seatId === id)));
+      showSeatConflict(takenSeats.map((t) => t.seatId));
+    }
+  }, [selectedSeats, order?.id, step, showSeatConflict]);
+
+  const handleSeatConflict = useCallback((conflictSeats: SeatUpdate[], message: string) => {
+    setSeats((prevSeats) => applySeatUpdates(prevSeats, conflictSeats));
+    showSeatConflict(conflictSeats.map((s) => s.seatId));
+    setError(message);
+  }, [showSeatConflict]);
+
+  const handleOrderCompleted = useCallback((completedOrderId: string, seatUpdates: SeatUpdate[]) => {
+    // Always refresh seats from server for accuracy
+    if (flightId) {
+      api.getFlightSeats(flightId).then(setSeats).catch(console.error);
+    }
+    
+    if (completedOrderId !== order?.id) {
+      // Another order completed - check if it affects our selection
+      const bookedSeats = seatUpdates.filter((s) => selectedSeats.includes(s.seatId));
+      if (bookedSeats.length > 0 && step === 'seats') {
+        setSelectedSeats((prev) => prev.filter((id) => !bookedSeats.some((b) => b.seatId === id)));
+        showSeatConflict(bookedSeats.map((s) => s.seatId));
+      }
+    }
+  }, [order?.id, flightId, selectedSeats, step, showSeatConflict]);
+
+  const handleOrderExpired = useCallback((expiredOrderId: string, seatUpdates: SeatUpdate[]) => {
+    // Always refresh seats from server for accuracy
+    if (flightId) {
+      api.getFlightSeats(flightId).then(setSeats).catch(console.error);
+    }
+    
+    if (expiredOrderId !== order?.id) {
+      // Another order expired - seats are now available
+      showSeatsReleased(seatUpdates.map((s) => s.seatId));
+    }
+  }, [order?.id, flightId, showSeatsReleased]);
+
+  // Connect to WebSocket for real-time updates
+  const { isConnected } = useFlightWebSocket({
+    flightId,
+    orderId: order?.id,
+    onSeatsUpdated: handleSeatsUpdated,
+    onSeatConflict: handleSeatConflict,
+    onOrderCompleted: handleOrderCompleted,
+    onOrderExpired: handleOrderExpired,
+  });
+
+  // Restore session from localStorage on mount
+  useEffect(() => {
+    if (!flightId || sessionRestored.current) return;
+
+    const session = getOrderSession(flightId);
+    if (!session) {
+      // No session to restore - let the other useEffect handle loading
+      sessionRestored.current = false; // Explicitly false so other effect runs
+      setRestoringSession(false);
+      return;
+    }
+    
+    // Mark that we're handling session restoration
+    sessionRestored.current = true;
+
+    // Fetch order status, flight, and seats in parallel for session restoration
+    Promise.all([
+      api.getOrderStatus(session.orderId),
+      api.getFlight(flightId),
+      api.getFlightSeats(flightId),
+    ])
+      .then(([status, flightData, seatsData]) => {
+        const orderStatus = status.order.status;
+        
+        // Check if order is in a terminal state
+        if (['confirmed', 'failed', 'cancelled', 'expired'].includes(orderStatus)) {
+          // Clear session and start fresh, but keep the flight/seat data
+          clearOrderSession(flightId);
+          setFlight(flightData);
+          setSeats(seatsData);
+          setLoading(false);
+          setRestoringSession(false);
+          return;
+        }
+
+        // Check if timer has expired
+        if (status.remainingSeconds <= 0) {
+          clearOrderSession(flightId);
+          setFlight(flightData);
+          setSeats(seatsData);
+          setLoading(false);
+          setRestoringSession(false);
+          return;
+        }
+
+        // Restore the session
+        setOrder(status.order);
+        setRemainingSeconds(status.remainingSeconds);
+        setCustomerInfo({
+          name: session.customerName,
+          email: session.customerEmail,
+        });
+        setFlight(flightData);
+        setSeats(seatsData);
+
+        // Restore selected seats from order - convert seat numbers to IDs
+        if (status.order.seats && status.order.seats.length > 0) {
+          const seatIds = seatsData
+            .filter((s) => status.order.seats.includes(`${s.row}${s.column}`))
+            .map((s) => s.id);
+          setSelectedSeats(seatIds);
+          console.log('Restored selected seats:', seatIds);
+        }
+
+        // Determine which step to restore to
+        if (orderStatus === 'pending') {
+          setStep('seats');
+        } else if (['seats_selected', 'awaiting_payment', 'processing'].includes(orderStatus)) {
+          setStep('payment');
+        }
+
+        console.log('Session restored for order:', session.orderId);
+        
+        // IMPORTANT: Mark restoration as complete
+        setLoading(false);
+        setRestoringSession(false);
+      })
+      .catch((err) => {
+        console.error('Failed to restore session:', err);
+        // Order not found or error - clear session and load fresh data
+        clearOrderSession(flightId);
+        // Load flight and seats fresh
+        Promise.all([api.getFlight(flightId), api.getFlightSeats(flightId)])
+          .then(([flightData, seatsData]) => {
+            setFlight(flightData);
+            setSeats(seatsData);
+          })
+          .catch((e) => setError(e.message))
+          .finally(() => {
+            setLoading(false);
+            setRestoringSession(false);
+          });
+      });
+  }, [flightId]);
+
+  // Fetch flight and seats (only when no session to restore)
   useEffect(() => {
     if (!flightId) return;
 
+    // Skip if session restoration already handled data loading
+    if (sessionRestored.current) return;
+    
+    // Check if there's a session to restore - if so, the other effect will handle it
+    const session = getOrderSession(flightId);
+    if (session) return;
+
+    // No session - load data fresh
+    setRestoringSession(false);
     Promise.all([api.getFlight(flightId), api.getFlightSeats(flightId)])
       .then(([flightData, seatsData]) => {
         setFlight(flightData);
@@ -74,6 +246,10 @@ export function BookingPage() {
       // Check for terminal states
       if (['confirmed', 'failed', 'cancelled', 'expired'].includes(status.order.status)) {
         setStep(status.order.status === 'confirmed' ? 'confirmed' : 'failed');
+        // Clear session on terminal state
+        if (flightId) {
+          clearOrderSession(flightId);
+        }
       }
     } catch (err) {
       console.error('Failed to poll status:', err);
@@ -102,6 +278,9 @@ export function BookingPage() {
       });
       setOrder(newOrder);
       setStep('seats');
+      
+      // Save session for page refresh recovery
+      saveOrderSession(flightId, newOrder.id, customerInfo.name, customerInfo.email);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create order');
     } finally {
@@ -128,7 +307,17 @@ export function BookingPage() {
       setRemainingSeconds(status.remainingSeconds);
       setStep('payment');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to select seats');
+      const errorMsg = err instanceof Error ? err.message : 'Failed to select seats';
+      // Check for seat conflict (409 status)
+      if (errorMsg.includes('not available') || errorMsg.includes('conflict')) {
+        showSeatConflict(selectedSeats);
+        // Refresh seats to get latest status
+        if (flightId) {
+          api.getFlightSeats(flightId).then(setSeats).catch(console.error);
+        }
+        setSelectedSeats([]);
+      }
+      setError(errorMsg);
     } finally {
       setSubmitting(false);
     }
@@ -139,12 +328,31 @@ export function BookingPage() {
     if (!order?.id || selectedSeats.length === 0) return;
 
     setSubmitting(true);
+    setError(null);
     try {
       const status = await api.selectSeats(order.id, selectedSeats);
       setOrder(status.order);
       setRemainingSeconds(status.remainingSeconds); // Timer refreshes!
+      
+      // Clear selection and collapse accordion - seats now show as "held"
+      setSelectedSeats([]);
+      setShowModifySeats(false);
+      
+      // Refresh seats to show updated status
+      if (flightId) {
+        api.getFlightSeats(flightId).then(setSeats).catch(console.error);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update seats');
+      const errorMsg = err instanceof Error ? err.message : 'Failed to update seats';
+      // Check for seat conflict
+      if (errorMsg.includes('not available') || errorMsg.includes('conflict')) {
+        showSeatConflict(selectedSeats);
+        // Refresh seats to get latest status
+        if (flightId) {
+          api.getFlightSeats(flightId).then(setSeats).catch(console.error);
+        }
+      }
+      setError(errorMsg);
     } finally {
       setSubmitting(false);
     }
@@ -171,10 +379,12 @@ export function BookingPage() {
   };
 
   const handleCancel = async () => {
-    if (!order?.id) return;
+    if (!order?.id || !flightId) return;
 
     try {
       await api.cancelOrder(order.id);
+      // Clear session so refresh doesn't restore cancelled order
+      clearOrderSession(flightId);
       navigate('/');
     } catch (err) {
       console.error('Failed to cancel:', err);
@@ -198,11 +408,13 @@ export function BookingPage() {
     return sum + (seat?.price || 0);
   }, 0);
 
-  if (loading) {
+  if (loading || restoringSession) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[400px] gap-4">
         <Loader2 className="w-12 h-12 text-cyan-500 animate-spin" />
-        <p className="text-slate-400">Loading flight details...</p>
+        <p className="text-slate-400">
+          {restoringSession ? 'Restoring your session...' : 'Loading flight details...'}
+        </p>
       </div>
     );
   }
@@ -354,6 +566,12 @@ export function BookingPage() {
                   seats={seats}
                   selectedSeats={selectedSeats}
                   onSeatSelect={handleSeatSelect}
+                  ownHeldSeats={
+                    // Convert seat numbers ("1A") to seat IDs (UUIDs)
+                    seats
+                      .filter((s) => order?.seats?.includes(`${s.row}${s.column}`))
+                      .map((s) => s.id)
+                  }
                 />
               </CardContent>
               <CardFooter>
@@ -385,37 +603,62 @@ export function BookingPage() {
                 maxAttempts={3}
               />
               
-              {/* Option to modify seats */}
+              {/* Modify Seat Selection Accordion */}
               <Card>
-                <CardHeader>
-                  <CardTitle className="text-lg">Need to change seats?</CardTitle>
+                <CardHeader className="cursor-pointer" onClick={() => {
+                  const opening = !showModifySeats;
+                  setShowModifySeats(opening);
+                  
+                  // When opening, pre-select the currently held seats
+                  if (opening && order?.seats && order.seats.length > 0) {
+                    const heldSeatIds = seats
+                      .filter((s) => order.seats.includes(`${s.row}${s.column}`))
+                      .map((s) => s.id);
+                    setSelectedSeats(heldSeatIds);
+                  }
+                }}>
+                  <div className="flex items-center justify-between">
+                    <CardTitle className="text-lg">Modify Seat Selection</CardTitle>
+                    <span className={`transform transition-transform ${showModifySeats ? 'rotate-180' : ''}`}>
+                      ▼
+                    </span>
+                  </div>
                   <CardDescription>
-                    You can modify your seat selection. The timer will refresh.
+                    Change your selected seats (timer will refresh)
                   </CardDescription>
                 </CardHeader>
-                <CardContent>
-                  <details className="group">
-                    <summary className="cursor-pointer text-cyan-500 hover:text-cyan-400 flex items-center gap-2">
-                      <RefreshCw className="w-4 h-4" />
-                      Modify Seat Selection
-                    </summary>
-                    <div className="mt-4">
+                {showModifySeats && (
+                  <CardContent className="space-y-4">
                       <SeatMap
                         seats={seats}
                         selectedSeats={selectedSeats}
                         onSeatSelect={handleSeatSelect}
+                        ownHeldSeats={
+                          // Convert seat numbers ("1A") to seat IDs (UUIDs)
+                          seats
+                            .filter((s) => order?.seats?.includes(`${s.row}${s.column}`))
+                            .map((s) => s.id)
+                        }
                       />
                       <Button
-                        variant="outline"
                         onClick={handleModifySeats}
-                        disabled={submitting}
-                        className="mt-4"
-                      >
+                      disabled={selectedSeats.length === 0 || submitting}
+                      className="w-full"
+                    >
+                      {submitting ? (
+                        <>
+                          <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                          Updating Seats...
+                        </>
+                      ) : (
+                        <>
+                          <RefreshCw className="w-4 h-4 mr-2" />
                         Update Seats & Refresh Timer
+                        </>
+                      )}
                       </Button>
-                    </div>
-                  </details>
                 </CardContent>
+                )}
               </Card>
             </div>
           )}
@@ -505,6 +748,23 @@ export function BookingPage() {
                   )}
                 </div>
               )}
+
+              {/* Real-time connection status */}
+              <div className="pt-4 border-t border-slate-700">
+                <div className="flex items-center gap-2 text-xs">
+                  {isConnected ? (
+                    <>
+                      <Wifi className="w-3 h-3 text-emerald-400" />
+                      <span className="text-emerald-400">Live updates active</span>
+                    </>
+                  ) : (
+                    <>
+                      <WifiOff className="w-3 h-3 text-slate-500" />
+                      <span className="text-slate-500">Connecting...</span>
+                    </>
+                  )}
+                </div>
+              </div>
             </CardContent>
           </Card>
         </div>

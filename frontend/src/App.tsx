@@ -2,9 +2,11 @@ import { Routes, Route } from 'react-router-dom';
 import { Plane } from 'lucide-react';
 import { FlightList } from './components/FlightList';
 import { BookingPage } from './components/BookingPage';
+import { ToastProvider } from './components/ui/toast';
 
 function App() {
   return (
+    <ToastProvider>
     <div className="min-h-screen flex flex-col">
       {/* Header */}
       <header className="border-b border-slate-700/50 backdrop-blur-sm sticky top-0 z-50 bg-slate-900/80">
@@ -46,6 +48,7 @@ function App() {
         </div>
       </footer>
     </div>
+    </ToastProvider>
   );
 }
 
