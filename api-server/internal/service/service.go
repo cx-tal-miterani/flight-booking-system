@@ -148,9 +148,9 @@ func (s *BookingService) GetOrder(ctx context.Context, id string) (*OrderStatusR
 
 	remaining, _ := s.repo.GetOrderRemainingSeconds(ctx, orderID)
 
-	// Broadcast when order is confirmed (only once per order)
+	// Broadcast order status changes (only once per order)
 	if order.Status == database.OrderStatusConfirmed {
-		if _, alreadyBroadcasted := broadcastedOrders.LoadOrStore(id, true); !alreadyBroadcasted {
+		if _, alreadyBroadcasted := broadcastedOrders.LoadOrStore(id+"-confirmed", true); !alreadyBroadcasted {
 			// Get seat UUIDs for broadcast
 			seatUUIDs, err := s.repo.GetOrderSeatIDs(ctx, orderID)
 			if err == nil && len(seatUUIDs) > 0 {
@@ -160,6 +160,19 @@ func (s *BookingService) GetOrder(ctx context.Context, id string) (*OrderStatusR
 					seatIDStrings[i] = sid.String()
 				}
 				hub.BroadcastOrderCompleted(order.FlightID.String(), id, seatIDStrings)
+			}
+		}
+	} else if order.Status == database.OrderStatusFailed || order.Status == database.OrderStatusExpired {
+		if _, alreadyBroadcasted := broadcastedOrders.LoadOrStore(id+"-failed", true); !alreadyBroadcasted {
+			// Get seat UUIDs for broadcast (seats should be released)
+			seatUUIDs, err := s.repo.GetOrderSeatIDs(ctx, orderID)
+			if err == nil && len(seatUUIDs) > 0 {
+				hub := websocket.GetHub()
+				seatIDStrings := make([]string, len(seatUUIDs))
+				for i, sid := range seatUUIDs {
+					seatIDStrings[i] = sid.String()
+				}
+				hub.BroadcastOrderExpired(order.FlightID.String(), id, seatIDStrings)
 			}
 		}
 	}

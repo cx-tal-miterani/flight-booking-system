@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Check, X, Loader2, Plane, RefreshCw, Wifi, WifiOff } from 'lucide-react';
 import { api } from '../api';
-import type { Flight, Seat, Order, OrderStatus } from '../types';
+import type { Flight, Seat, Order } from '../types';
 import { SeatMap } from './SeatMap';
 import { Timer } from './Timer';
 import { PaymentForm } from './PaymentForm';
@@ -68,7 +68,14 @@ export function BookingPage() {
       api.getFlightSeats(flightId).then(setSeats).catch(console.error);
     }
     
-    if (completedOrderId !== order?.id) {
+    if (completedOrderId === order?.id) {
+      // OUR order completed - show confirmation!
+      setOrder((prev) => prev ? { ...prev, status: 'confirmed' } : prev);
+      setStep('confirmed');
+      if (flightId) {
+        clearOrderSession(flightId);
+      }
+    } else {
       // Another order completed - check if it affects our selection
       const bookedSeats = seatUpdates.filter((s) => selectedSeats.includes(s.seatId));
       if (bookedSeats.length > 0 && step === 'seats') {
@@ -84,7 +91,14 @@ export function BookingPage() {
       api.getFlightSeats(flightId).then(setSeats).catch(console.error);
     }
     
-    if (expiredOrderId !== order?.id) {
+    if (expiredOrderId === order?.id) {
+      // OUR order expired - show failure!
+      setOrder((prev) => prev ? { ...prev, status: 'expired', failureReason: 'Reservation expired' } : prev);
+      setStep('failed');
+      if (flightId) {
+        clearOrderSession(flightId);
+      }
+    } else {
       // Another order expired - seats are now available
       showSeatsReleased(seatUpdates.map((s) => s.seatId));
     }
@@ -217,31 +231,14 @@ export function BookingPage() {
       .finally(() => setLoading(false));
   }, [flightId]);
 
-  // Poll order status for real-time updates
-  const pollOrderStatus = useCallback(async () => {
+  // Check order status (used after payment submission as fallback)
+  const checkOrderStatus = useCallback(async () => {
     if (!order?.id) return;
     
     try {
       const status = await api.getOrderStatus(order.id);
       setOrder(status.order);
       setRemainingSeconds(status.remainingSeconds);
-
-      // Update step based on status
-      const statusStepMap: Partial<Record<OrderStatus, BookingStep>> = {
-        pending: 'seats',
-        seats_selected: step === 'payment' ? 'payment' : 'seats',
-        awaiting_payment: 'payment',
-        processing: 'payment',
-        confirmed: 'confirmed',
-        failed: 'failed',
-        cancelled: 'failed',
-        expired: 'failed',
-      };
-      
-      const newStep = statusStepMap[status.order.status];
-      if (newStep && newStep !== step && step !== 'payment') {
-        setStep(newStep);
-      }
       
       // Check for terminal states
       if (['confirmed', 'failed', 'cancelled', 'expired'].includes(status.order.status)) {
@@ -252,17 +249,28 @@ export function BookingPage() {
         }
       }
     } catch (err) {
-      console.error('Failed to poll status:', err);
+      console.error('Failed to check order status:', err);
     }
-  }, [order?.id, step]);
+  }, [order?.id, flightId]);
 
-  // Poll every 2 seconds when order exists
+  // Handle local timer expiry - check with server if order expired
   useEffect(() => {
-    if (!order?.id) return;
+    if (remainingSeconds === 0 && order?.id && ['seats', 'payment'].includes(step)) {
+      // Timer reached 0, check with server if order expired
+      checkOrderStatus();
+    }
+  }, [remainingSeconds, order?.id, step, checkOrderStatus]);
+
+  // Decrement timer locally every second
+  useEffect(() => {
+    if (remainingSeconds <= 0 || !['seats', 'payment'].includes(step)) return;
     
-    const interval = setInterval(pollOrderStatus, 2000);
+    const interval = setInterval(() => {
+      setRemainingSeconds((prev) => Math.max(0, prev - 1));
+    }, 1000);
+    
     return () => clearInterval(interval);
-  }, [order?.id, pollOrderStatus]);
+  }, [remainingSeconds, step]);
 
   const handleCustomerSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -367,10 +375,10 @@ export function BookingPage() {
       const status = await api.submitPayment(order.id, paymentCode);
       setOrder(status.order);
       
-      // Poll for final status after payment
-      setTimeout(pollOrderStatus, 1000);
-      setTimeout(pollOrderStatus, 2000);
-      setTimeout(pollOrderStatus, 3000);
+      // WebSocket will notify us of completion, but check as fallback
+      // in case WebSocket message is missed
+      setTimeout(checkOrderStatus, 2000);
+      setTimeout(checkOrderStatus, 5000);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Payment failed');
     } finally {
