@@ -12,9 +12,9 @@ import (
 )
 
 var (
-	ErrNotFound      = errors.New("not found")
+	ErrNotFound         = errors.New("not found")
 	ErrSeatNotAvailable = errors.New("seat not available")
-	ErrOrderExpired  = errors.New("order reservation expired")
+	ErrOrderExpired     = errors.New("order reservation expired")
 )
 
 // Repository handles all database operations
@@ -429,3 +429,27 @@ func (r *Repository) GetSeatIDsByFlightAndNumbers(ctx context.Context, flightID 
 	return ids, nil
 }
 
+// GetOrderSeatIDs returns the seat IDs associated with an order
+func (r *Repository) GetOrderSeatIDs(ctx context.Context, orderID uuid.UUID) ([]uuid.UUID, error) {
+	query := `
+		SELECT seat_id FROM order_seats
+		WHERE order_id = $1
+	`
+
+	rows, err := r.pool.Query(ctx, query, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query order seats: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan seat id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+
+	return ids, nil
+}

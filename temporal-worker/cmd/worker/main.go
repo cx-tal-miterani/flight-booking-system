@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 
@@ -10,6 +9,7 @@ import (
 	"github.com/cx-tal-miterani/flight-booking-system/temporal-worker/internal/repository"
 	"github.com/cx-tal-miterani/flight-booking-system/temporal-worker/internal/workflows"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 )
@@ -56,12 +56,12 @@ func main() {
 
 	// Create and register activities
 	acts := activities.NewActivities(repo)
-	w.RegisterActivityWithOptions(acts.ValidatePayment, worker.RegisterActivityOptions{Name: "ValidatePayment"})
-	w.RegisterActivityWithOptions(acts.ReserveSeats, worker.RegisterActivityOptions{Name: "ReserveSeats"})
-	w.RegisterActivityWithOptions(acts.ReleaseSeats, worker.RegisterActivityOptions{Name: "ReleaseSeats"})
-	w.RegisterActivityWithOptions(acts.SendConfirmation, worker.RegisterActivityOptions{Name: "SendConfirmation"})
-	w.RegisterActivityWithOptions(acts.CheckReservationExpiry, worker.RegisterActivityOptions{Name: "CheckReservationExpiry"})
-	w.RegisterActivityWithOptions(acts.UpdateOrderStatus, worker.RegisterActivityOptions{Name: "UpdateOrderStatus"})
+	w.RegisterActivityWithOptions(acts.ValidatePayment, activity.RegisterOptions{Name: "ValidatePayment"})
+	w.RegisterActivityWithOptions(acts.ReserveSeats, activity.RegisterOptions{Name: "ReserveSeats"})
+	w.RegisterActivityWithOptions(acts.ReleaseSeats, activity.RegisterOptions{Name: "ReleaseSeats"})
+	w.RegisterActivityWithOptions(acts.SendConfirmation, activity.RegisterOptions{Name: "SendConfirmation"})
+	w.RegisterActivityWithOptions(acts.CheckReservationExpiry, activity.RegisterOptions{Name: "CheckReservationExpiry"})
+	w.RegisterActivityWithOptions(acts.UpdateOrderStatus, activity.RegisterOptions{Name: "UpdateOrderStatus"})
 
 	// Start worker
 	log.Println("Starting Temporal worker...")

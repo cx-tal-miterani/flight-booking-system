@@ -9,7 +9,10 @@ export default {
       colors: {
         midnight: '#0a0a0f',
         charcoal: '#141419',
-        slate: '#1e1e28',
+        'custom-slate': '#1e1e28',
+        border: 'hsl(var(--border))',
+        foreground: 'hsl(var(--foreground))',
+        background: 'hsl(var(--background))',
         accent: {
           cyan: '#00d4ff',
           emerald: '#10b981',

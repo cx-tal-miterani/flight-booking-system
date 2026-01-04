@@ -1,8 +1,8 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Check, X, Loader2, Plane, RefreshCw } from 'lucide-react';
 import { api } from '../api';
-import type { Flight, Seat, Order, OrderStatus } from '../types';
+import type { Flight, Seat, Order } from '../types';
 import { SeatMap } from './SeatMap';
 import { Timer } from './Timer';
 import { PaymentForm } from './PaymentForm';
@@ -12,6 +12,7 @@ import { Input } from './ui/input';
 import { Badge } from './ui/badge';
 import { Alert, AlertDescription } from './ui/alert';
 import { formatCurrency } from '../lib/utils';
+import { useFlightWebSocket } from '../hooks/useFlightWebSocket';
 
 type BookingStep = 'customer' | 'seats' | 'payment' | 'confirmed' | 'failed';
 
@@ -31,6 +32,9 @@ export function BookingPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [customerInfo, setCustomerInfo] = useState({ name: '', email: '' });
+  const [modifySeatsOpen, setModifySeatsOpen] = useState(false);
+  const [paymentProcessing, setPaymentProcessing] = useState(false);
+  const lastPaymentAttempts = useRef(0);
 
   // Fetch flight and seats
   useEffect(() => {
@@ -45,8 +49,118 @@ export function BookingPage() {
       .finally(() => setLoading(false));
   }, [flightId]);
 
-  // Poll order status for real-time updates
-  const pollOrderStatus = useCallback(async () => {
+  // WebSocket handlers for real-time updates
+  const handleSeatsUpdated = useCallback((seatIds: string[], status: string, wsOrderId?: string) => {
+    // Update seat statuses in real-time
+    setSeats((prevSeats) =>
+      prevSeats.map((seat) => {
+        if (seatIds.includes(seat.id)) {
+          return {
+            ...seat,
+            status: status as Seat['status'],
+            heldByOrder: wsOrderId || null,
+          };
+        }
+        return seat;
+      })
+    );
+    
+    // If another user held seats that we had selected, remove them from our selection
+    if (status === 'held' && wsOrderId && wsOrderId !== order?.id) {
+      setSelectedSeats((prev) => {
+        const conflicting = prev.filter((id) => seatIds.includes(id));
+        if (conflicting.length > 0) {
+          // Show notification about removed seats
+          setError(`Some seats you selected were just reserved by another user and have been removed from your selection.`);
+          return prev.filter((id) => !seatIds.includes(id));
+        }
+        return prev;
+      });
+    }
+  }, [order?.id]);
+
+  const handleSeatConflict = useCallback((seatIds: string[]) => {
+    // Show conflict notification
+    const seatNumbers = seats
+      .filter((s) => seatIds.includes(s.id))
+      .map((s) => `${s.row}${s.column}`)
+      .join(', ');
+    setError(`Seats ${seatNumbers} are no longer available. Please select different seats.`);
+    
+    // Deselect conflicting seats
+    setSelectedSeats((prev) => prev.filter((id) => !seatIds.includes(id)));
+  }, [seats]);
+
+  const handleOrderCompleted = useCallback((wsOrderId: string, seatIds: string[]) => {
+    // If it's our order, show confirmed screen
+    if (order?.id === wsOrderId) {
+      setStep('confirmed');
+      // Update our order status
+      setOrder((prev) => prev ? { ...prev, status: 'confirmed' } : null);
+    } else {
+      // Another user's order was completed - remove any of their booked seats from our selection
+      setSelectedSeats((prev) => {
+        const conflicting = prev.filter((id) => seatIds.includes(id));
+        if (conflicting.length > 0) {
+          setError(`Some seats you selected have been booked by another user and have been removed from your selection.`);
+          return prev.filter((id) => !seatIds.includes(id));
+        }
+        return prev;
+      });
+    }
+    // Update seat statuses to booked for everyone
+    setSeats((prevSeats) =>
+      prevSeats.map((seat) => {
+        if (seatIds.includes(seat.id)) {
+          return { ...seat, status: 'booked', heldByOrder: null };
+        }
+        return seat;
+      })
+    );
+  }, [order?.id]);
+
+  const handleOrderExpired = useCallback((wsOrderId: string, seatIds: string[]) => {
+    // If it's our order, show failed screen
+    if (order?.id === wsOrderId) {
+      setStep('failed');
+      setOrder((prev) => prev ? { ...prev, status: 'expired', failureReason: 'Reservation expired' } : null);
+    }
+    // Update seat statuses to available for everyone
+    setSeats((prevSeats) =>
+      prevSeats.map((seat) => {
+        if (seatIds.includes(seat.id)) {
+          return { ...seat, status: 'available', heldByOrder: null };
+        }
+        return seat;
+      })
+    );
+  }, [order?.id]);
+
+  const handleSeatsReleased = useCallback((seatIds: string[]) => {
+    // Update seat statuses to available
+    setSeats((prevSeats) =>
+      prevSeats.map((seat) => {
+        if (seatIds.includes(seat.id)) {
+          return { ...seat, status: 'available', heldByOrder: null };
+        }
+        return seat;
+      })
+    );
+  }, []);
+
+  // Connect WebSocket for real-time updates
+  useFlightWebSocket({
+    flightId,
+    orderId: order?.id,
+    onSeatsUpdated: handleSeatsUpdated,
+    onSeatConflict: handleSeatConflict,
+    onOrderCompleted: handleOrderCompleted,
+    onOrderExpired: handleOrderExpired,
+    onSeatsReleased: handleSeatsReleased,
+  });
+
+  // Check order status after payment submission (one-time check, not polling)
+  const checkOrderStatus = useCallback(async () => {
     if (!order?.id) return;
     
     try {
@@ -54,39 +168,28 @@ export function BookingPage() {
       setOrder(status.order);
       setRemainingSeconds(status.remainingSeconds);
 
-      // Update step based on status
-      const statusStepMap: Partial<Record<OrderStatus, BookingStep>> = {
-        pending: 'seats',
-        seats_selected: step === 'payment' ? 'payment' : 'seats',
-        awaiting_payment: 'payment',
-        processing: 'payment',
-        confirmed: 'confirmed',
-        failed: 'failed',
-        cancelled: 'failed',
-        expired: 'failed',
-      };
-      
-      const newStep = statusStepMap[status.order.status];
-      if (newStep && newStep !== step && step !== 'payment') {
-        setStep(newStep);
-      }
-      
       // Check for terminal states
       if (['confirmed', 'failed', 'cancelled', 'expired'].includes(status.order.status)) {
         setStep(status.order.status === 'confirmed' ? 'confirmed' : 'failed');
       }
     } catch (err) {
-      console.error('Failed to poll status:', err);
+      console.error('Failed to check order status:', err);
     }
-  }, [order?.id, step]);
+  }, [order?.id]);
 
-  // Poll every 2 seconds when order exists
+  // Detect when payment processing completes
   useEffect(() => {
-    if (!order?.id) return;
+    if (!paymentProcessing || !order) return;
     
-    const interval = setInterval(pollOrderStatus, 2000);
-    return () => clearInterval(interval);
-  }, [order?.id, pollOrderStatus]);
+    // Payment is complete if we reach a terminal state or payment attempts increased
+    const isTerminal = ['confirmed', 'failed', 'cancelled', 'expired'].includes(order.status);
+    const attemptsIncreased = order.paymentAttempts > lastPaymentAttempts.current;
+    
+    if (isTerminal || attemptsIncreased) {
+      setPaymentProcessing(false);
+      lastPaymentAttempts.current = order.paymentAttempts;
+    }
+  }, [paymentProcessing, order?.status, order?.paymentAttempts]);
 
   const handleCustomerSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -143,6 +246,7 @@ export function BookingPage() {
       const status = await api.selectSeats(order.id, selectedSeats);
       setOrder(status.order);
       setRemainingSeconds(status.remainingSeconds); // Timer refreshes!
+      setModifySeatsOpen(false); // Close the accordion after successful update
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update seats');
     } finally {
@@ -151,20 +255,23 @@ export function BookingPage() {
   };
 
   const handlePayment = async (paymentCode: string) => {
-    if (!order?.id) return;
+    if (!order?.id || submitting || paymentProcessing) return;
 
     setSubmitting(true);
+    setPaymentProcessing(true);
     setError(null);
+    lastPaymentAttempts.current = order.paymentAttempts;
+    
     try {
       const status = await api.submitPayment(order.id, paymentCode);
       setOrder(status.order);
+      setRemainingSeconds(status.remainingSeconds);
       
-      // Poll for final status after payment
-      setTimeout(pollOrderStatus, 1000);
-      setTimeout(pollOrderStatus, 2000);
-      setTimeout(pollOrderStatus, 3000);
+      // Check status once after a short delay (WebSocket will handle real-time updates)
+      setTimeout(checkOrderStatus, 2000);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Payment failed');
+      setPaymentProcessing(false);
     } finally {
       setSubmitting(false);
     }
@@ -197,6 +304,11 @@ export function BookingPage() {
     const seat = seats.find((s) => s.id === seatId);
     return sum + (seat?.price || 0);
   }, 0);
+
+  // Get seats held by the current user's order
+  const ownHeldSeats = seats
+    .filter((seat) => seat.heldByOrder === order?.id)
+    .map((seat) => seat.id);
 
   if (loading) {
     return (
@@ -354,6 +466,7 @@ export function BookingPage() {
                   seats={seats}
                   selectedSeats={selectedSeats}
                   onSeatSelect={handleSeatSelect}
+                  ownHeldSeats={ownHeldSeats}
                 />
               </CardContent>
               <CardFooter>
@@ -380,7 +493,7 @@ export function BookingPage() {
             <div className="space-y-6">
               <PaymentForm
                 onSubmit={handlePayment}
-                loading={submitting}
+                loading={paymentProcessing}
                 attempts={order?.paymentAttempts || 0}
                 maxAttempts={3}
               />
@@ -394,7 +507,11 @@ export function BookingPage() {
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <details className="group">
+                  <details 
+                    className="group" 
+                    open={modifySeatsOpen}
+                    onToggle={(e) => setModifySeatsOpen((e.target as HTMLDetailsElement).open)}
+                  >
                     <summary className="cursor-pointer text-cyan-500 hover:text-cyan-400 flex items-center gap-2">
                       <RefreshCw className="w-4 h-4" />
                       Modify Seat Selection
@@ -404,11 +521,12 @@ export function BookingPage() {
                         seats={seats}
                         selectedSeats={selectedSeats}
                         onSeatSelect={handleSeatSelect}
+                        ownHeldSeats={ownHeldSeats}
                       />
                       <Button
                         variant="outline"
                         onClick={handleModifySeats}
-                        disabled={submitting}
+                        disabled={submitting || selectedSeats.length === 0}
                         className="mt-4"
                       >
                         Update Seats & Refresh Timer
@@ -474,14 +592,21 @@ export function BookingPage() {
               {selectedSeats.length > 0 && (
                 <div className="flex justify-between text-sm">
                   <span className="text-slate-400">Seats ({selectedSeats.length})</span>
-                  <span className="text-white">{selectedSeats.map(s => s.split('-')[1]).join(', ')}</span>
+                  <span className="text-white">
+                    {selectedSeats
+                      .map(seatId => {
+                        const seat = seats.find(s => s.id === seatId);
+                        return seat ? `${seat.row}${seat.column}` : seatId;
+                      })
+                      .join(', ')}
+                  </span>
                 </div>
               )}
               <div className="border-t border-slate-700 pt-4">
                 <div className="flex justify-between text-lg">
                   <span className="text-white font-semibold">Total</span>
                   <span className="text-emerald-500 font-bold">
-                    {formatCurrency(order?.totalAmount || totalAmount)}
+                    {formatCurrency(modifySeatsOpen ? totalAmount : (order?.totalAmount || totalAmount))}
                   </span>
                 </div>
               </div>

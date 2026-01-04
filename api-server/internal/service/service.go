@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/cx-tal-miterani/flight-booking-system/api-server/internal/database"
+	"github.com/cx-tal-miterani/flight-booking-system/api-server/internal/websocket"
 	"github.com/google/uuid"
 	"go.temporal.io/sdk/client"
 )
@@ -129,6 +131,10 @@ func (s *BookingService) CreateOrder(ctx context.Context, req CreateOrderRequest
 	return order, nil
 }
 
+// Track orders that have already been broadcast as completed (to avoid duplicate broadcasts)
+var broadcastedCompletions = make(map[uuid.UUID]bool)
+var broadcastMu sync.Mutex
+
 // GetOrder returns order status
 func (s *BookingService) GetOrder(ctx context.Context, id string) (*OrderStatusResponse, error) {
 	orderID, err := uuid.Parse(id)
@@ -142,6 +148,28 @@ func (s *BookingService) GetOrder(ctx context.Context, id string) (*OrderStatusR
 	}
 
 	remaining, _ := s.repo.GetOrderRemainingSeconds(ctx, orderID)
+
+	// Broadcast order completion if order is confirmed and we haven't broadcast yet
+	if order.Status == database.OrderStatusConfirmed {
+		broadcastMu.Lock()
+		if !broadcastedCompletions[orderID] {
+			broadcastedCompletions[orderID] = true
+			broadcastMu.Unlock()
+			
+			// Get seat IDs and broadcast
+			seatUUIDs, err := s.repo.GetOrderSeatIDs(ctx, orderID)
+			if err == nil && len(seatUUIDs) > 0 {
+				hub := websocket.GetHub()
+				var seatIDStrs []string
+				for _, sid := range seatUUIDs {
+					seatIDStrs = append(seatIDStrs, sid.String())
+				}
+				hub.BroadcastOrderCompleted(order.FlightID.String(), seatIDStrs, id)
+			}
+		} else {
+			broadcastMu.Unlock()
+		}
+	}
 
 	return &OrderStatusResponse{
 		Order:            order,
@@ -160,6 +188,9 @@ func (s *BookingService) SelectSeats(ctx context.Context, orderID string, seatID
 	if err != nil {
 		return nil, err
 	}
+
+	// Get previously held seat UUIDs for comparison
+	oldSeatUUIDs, _ := s.repo.GetOrderSeatIDs(ctx, oid)
 
 	// Parse seat IDs (they come as "flightID-seatNumber" format from frontend)
 	var seatUUIDs []uuid.UUID
@@ -209,6 +240,32 @@ func (s *BookingService) SelectSeats(ctx context.Context, orderID string, seatID
 			fmt.Printf("Warning: failed to signal workflow: %v\n", err)
 		}
 	}
+
+	// Broadcast WebSocket updates
+	hub := websocket.GetHub()
+	flightIDStr := order.FlightID.String()
+
+	// Find seats that were released (in old but not in new)
+	newSeatSet := make(map[uuid.UUID]bool)
+	for _, id := range seatUUIDs {
+		newSeatSet[id] = true
+	}
+	var releasedSeats []string
+	for _, oldID := range oldSeatUUIDs {
+		if !newSeatSet[oldID] {
+			releasedSeats = append(releasedSeats, oldID.String())
+		}
+	}
+	if len(releasedSeats) > 0 {
+		hub.BroadcastSeatsReleased(flightIDStr, releasedSeats, orderID)
+	}
+
+	// Broadcast newly held seats
+	var heldSeats []string
+	for _, id := range seatUUIDs {
+		heldSeats = append(heldSeats, id.String())
+	}
+	hub.BroadcastSeatsHeld(flightIDStr, heldSeats, orderID)
 
 	return s.GetOrder(ctx, orderID)
 }
@@ -261,6 +318,9 @@ func (s *BookingService) CancelOrder(ctx context.Context, orderID string) error 
 		return err
 	}
 
+	// Get seat UUIDs before releasing
+	seatUUIDs, _ := s.repo.GetOrderSeatIDs(ctx, oid)
+
 	// Release seats
 	s.repo.ReleaseSeats(ctx, oid)
 
@@ -270,6 +330,16 @@ func (s *BookingService) CancelOrder(ctx context.Context, orderID string) error 
 	// Cancel workflow
 	if order.WorkflowID != nil {
 		s.temporalClient.CancelWorkflow(ctx, *order.WorkflowID, "")
+	}
+
+	// Broadcast WebSocket update for released seats
+	if len(seatUUIDs) > 0 {
+		hub := websocket.GetHub()
+		var seatIDStrs []string
+		for _, id := range seatUUIDs {
+			seatIDStrs = append(seatIDStrs, id.String())
+		}
+		hub.BroadcastOrderExpired(order.FlightID.String(), seatIDStrs, orderID)
 	}
 
 	return nil

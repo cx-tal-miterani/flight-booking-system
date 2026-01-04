@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/cx-tal-miterani/flight-booking-system/api-server/internal/handlers"
+	"github.com/cx-tal-miterani/flight-booking-system/api-server/internal/websocket"
 	"github.com/gorilla/mux"
 )
 
@@ -21,6 +22,9 @@ func SetupRouter(h *handlers.Handler) *mux.Router {
 	api.HandleFunc("/flights", h.GetFlights).Methods(http.MethodGet, http.MethodOptions)
 	api.HandleFunc("/flights/{id}", h.GetFlight).Methods(http.MethodGet, http.MethodOptions)
 	api.HandleFunc("/flights/{id}/seats", h.GetFlightSeats).Methods(http.MethodGet, http.MethodOptions)
+
+	// WebSocket for real-time seat updates
+	api.HandleFunc("/flights/{flightId}/ws", websocket.HandleWebSocket)
 
 	// Orders
 	api.HandleFunc("/orders", h.CreateOrder).Methods(http.MethodPost, http.MethodOptions)

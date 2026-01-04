@@ -18,6 +18,7 @@ export interface Seat {
   class: 'economy' | 'business' | 'first';
   status: 'available' | 'held' | 'booked';
   price: number;
+  heldByOrder?: string | null;
 }
 
 export type OrderStatus =
