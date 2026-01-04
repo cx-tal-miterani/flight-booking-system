@@ -4,17 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/cx-tal-miterani/flight-booking-system/api-server/internal/database"
-	"github.com/cx-tal-miterani/flight-booking-system/api-server/internal/websocket"
 	"github.com/google/uuid"
 	"go.temporal.io/sdk/client"
 )
-
-// Track orders that have already been broadcasted as completed
-var broadcastedOrders sync.Map
 
 // Service defines the interface for business logic
 type Service interface {
@@ -148,35 +143,6 @@ func (s *BookingService) GetOrder(ctx context.Context, id string) (*OrderStatusR
 
 	remaining, _ := s.repo.GetOrderRemainingSeconds(ctx, orderID)
 
-	// Broadcast order status changes (only once per order)
-	if order.Status == database.OrderStatusConfirmed {
-		if _, alreadyBroadcasted := broadcastedOrders.LoadOrStore(id+"-confirmed", true); !alreadyBroadcasted {
-			// Get seat UUIDs for broadcast
-			seatUUIDs, err := s.repo.GetOrderSeatIDs(ctx, orderID)
-			if err == nil && len(seatUUIDs) > 0 {
-				hub := websocket.GetHub()
-				seatIDStrings := make([]string, len(seatUUIDs))
-				for i, sid := range seatUUIDs {
-					seatIDStrings[i] = sid.String()
-				}
-				hub.BroadcastOrderCompleted(order.FlightID.String(), id, seatIDStrings)
-			}
-		}
-	} else if order.Status == database.OrderStatusFailed || order.Status == database.OrderStatusExpired {
-		if _, alreadyBroadcasted := broadcastedOrders.LoadOrStore(id+"-failed", true); !alreadyBroadcasted {
-			// Get seat UUIDs for broadcast (seats should be released)
-			seatUUIDs, err := s.repo.GetOrderSeatIDs(ctx, orderID)
-			if err == nil && len(seatUUIDs) > 0 {
-				hub := websocket.GetHub()
-				seatIDStrings := make([]string, len(seatUUIDs))
-				for i, sid := range seatUUIDs {
-					seatIDStrings[i] = sid.String()
-				}
-				hub.BroadcastOrderExpired(order.FlightID.String(), id, seatIDStrings)
-			}
-		}
-	}
-
 	return &OrderStatusResponse{
 		Order:            order,
 		RemainingSeconds: remaining,
@@ -194,9 +160,6 @@ func (s *BookingService) SelectSeats(ctx context.Context, orderID string, seatID
 	if err != nil {
 		return nil, err
 	}
-
-	// Get the OLD seat UUIDs before modifying (for broadcasting released seats)
-	oldSeatUUIDs, _ := s.repo.GetOrderSeatIDs(ctx, oid)
 
 	// Parse seat IDs (they come as "flightID-seatNumber" format from frontend)
 	var seatUUIDs []uuid.UUID
@@ -227,12 +190,6 @@ func (s *BookingService) SelectSeats(ctx context.Context, orderID string, seatID
 
 	// Hold seats (this refreshes the 15-minute timer)
 	if err := s.repo.HoldSeats(ctx, oid, seatUUIDs); err != nil {
-		// Check if this is a seat conflict error
-		if errors.Is(err, database.ErrSeatNotAvailable) {
-			// Notify the client about the conflict via WebSocket
-			hub := websocket.GetHub()
-			hub.NotifySeatConflict(order.FlightID.String(), orderID, seatIDs)
-		}
 		return nil, fmt.Errorf("failed to hold seats: %w", err)
 	}
 
@@ -240,32 +197,6 @@ func (s *BookingService) SelectSeats(ctx context.Context, orderID string, seatID
 	if err := s.repo.SetOrderSeats(ctx, oid, seatUUIDs); err != nil {
 		return nil, fmt.Errorf("failed to set order seats: %w", err)
 	}
-
-	// Calculate released seats (old seats that are not in new selection)
-	newSeatSet := make(map[uuid.UUID]bool)
-	for _, id := range seatUUIDs {
-		newSeatSet[id] = true
-	}
-	var releasedSeats []string
-	for _, oldID := range oldSeatUUIDs {
-		if !newSeatSet[oldID] {
-			releasedSeats = append(releasedSeats, oldID.String())
-		}
-	}
-
-	hub := websocket.GetHub()
-
-	// Broadcast released seats as available (use SeatsReleased, not OrderExpired)
-	if len(releasedSeats) > 0 {
-		hub.BroadcastSeatsReleased(order.FlightID.String(), orderID, releasedSeats)
-	}
-
-	// Broadcast newly held seats
-	seatIDStrings := make([]string, len(seatUUIDs))
-	for i, id := range seatUUIDs {
-		seatIDStrings[i] = id.String()
-	}
-	hub.BroadcastSeatsHeld(order.FlightID.String(), orderID, seatIDStrings)
 
 	// Signal workflow about seat selection
 	if order.WorkflowID != nil {
@@ -294,48 +225,11 @@ func (s *BookingService) SubmitPayment(ctx context.Context, orderID string, paym
 		return nil, err
 	}
 
-	// Check if order is in a terminal state
-	if order.Status == database.OrderStatusConfirmed ||
-		order.Status == database.OrderStatusFailed ||
-		order.Status == database.OrderStatusCancelled ||
-		order.Status == database.OrderStatusExpired {
-		return nil, fmt.Errorf("order is already in terminal state: %s", order.Status)
-	}
-
-	// Check if order is already processing (prevent double submission)
-	if order.Status == database.OrderStatusProcessing {
-		// Return current status without error - payment is in progress
-		return s.GetOrder(ctx, orderID)
-	}
-
-	// Check max payment attempts (3 max)
-	const maxAttempts = 3
-	if order.PaymentAttempts >= maxAttempts {
-		s.repo.UpdateOrderStatus(ctx, oid, database.OrderStatusFailed)
-		reason := "Maximum payment attempts exceeded"
-		s.repo.UpdateOrderPayment(ctx, oid, order.PaymentAttempts, &reason)
-		return nil, fmt.Errorf("maximum payment attempts (%d) exceeded", maxAttempts)
-	}
-
 	// Check if reservation expired
 	remaining, _ := s.repo.GetOrderRemainingSeconds(ctx, oid)
 	if remaining <= 0 {
-		// Get seat UUIDs before releasing for WebSocket broadcast
-		seatUUIDs, _ := s.repo.GetOrderSeatIDs(ctx, oid)
-		
 		s.repo.UpdateOrderStatus(ctx, oid, database.OrderStatusExpired)
 		s.repo.ReleaseSeats(ctx, oid)
-		
-		// Broadcast seat release to all clients
-		if len(seatUUIDs) > 0 {
-			hub := websocket.GetHub()
-			seatIDStrings := make([]string, len(seatUUIDs))
-			for i, id := range seatUUIDs {
-				seatIDStrings[i] = id.String()
-			}
-			hub.BroadcastOrderExpired(order.FlightID.String(), orderID, seatIDStrings)
-		}
-		
 		return nil, database.ErrOrderExpired
 	}
 
@@ -367,25 +261,8 @@ func (s *BookingService) CancelOrder(ctx context.Context, orderID string) error 
 		return err
 	}
 
-	// Get seat UUIDs before releasing for WebSocket broadcast
-	seatUUIDs, err := s.repo.GetOrderSeatIDs(ctx, oid)
-	if err != nil {
-		// Log but continue with cancellation
-		fmt.Printf("Warning: failed to get seat IDs for WebSocket broadcast: %v\n", err)
-	}
-
 	// Release seats
 	s.repo.ReleaseSeats(ctx, oid)
-
-	// Broadcast seat release to all clients
-	if len(seatUUIDs) > 0 {
-		hub := websocket.GetHub()
-		seatIDStrings := make([]string, len(seatUUIDs))
-		for i, id := range seatUUIDs {
-			seatIDStrings[i] = id.String()
-		}
-		hub.BroadcastOrderExpired(order.FlightID.String(), orderID, seatIDStrings)
-	}
 
 	// Update status
 	s.repo.UpdateOrderStatus(ctx, oid, database.OrderStatusCancelled)

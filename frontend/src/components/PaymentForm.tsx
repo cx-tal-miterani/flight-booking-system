@@ -58,9 +58,6 @@ export function PaymentForm({ onSubmit, loading, attempts, maxAttempts = 3 }: Pa
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    // Prevent submission while loading
-    if (loading) return;
-    
     const code = digits.join('');
     if (code.length === 5) {
       onSubmit(code);

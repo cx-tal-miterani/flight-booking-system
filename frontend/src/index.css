@@ -52,10 +52,6 @@
   @apply bg-amber-600/50 cursor-not-allowed;
 }
 
-.seat-held-own {
-  @apply bg-amber-600/50 cursor-pointer hover:bg-amber-500/70 hover:scale-105;
-}
-
 .seat-booked {
   @apply bg-slate-800 cursor-not-allowed opacity-40;
 }

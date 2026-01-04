@@ -6,10 +6,9 @@ interface SeatMapProps {
   seats: Seat[];
   selectedSeats: string[];
   onSeatSelect: (seatId: string) => void;
-  ownHeldSeats?: string[]; // Seats held by current user's order (can be unselected)
 }
 
-export function SeatMap({ seats, selectedSeats, onSeatSelect, ownHeldSeats = [] }: SeatMapProps) {
+export function SeatMap({ seats, selectedSeats, onSeatSelect }: SeatMapProps) {
   // Group seats by row
   const seatsByRow = useMemo(() => {
     return seats.reduce((acc, seat) => {
@@ -23,30 +22,15 @@ export function SeatMap({ seats, selectedSeats, onSeatSelect, ownHeldSeats = [] 
 
   const getSeatClass = (seat: Seat) => {
     if (selectedSeats.includes(seat.id)) return 'seat-selected';
-    if (seat.status === 'held') {
-      // Use different style for own held seats (clickable)
-      if (ownHeldSeats.includes(seat.id)) return 'seat-held-own';
-      return 'seat-held';
-    }
+    if (seat.status === 'held') return 'seat-held';
     if (seat.status === 'booked') return 'seat-booked';
     return 'seat-available';
   };
 
   const handleSeatClick = (seat: Seat) => {
-    // Allow clicking if: available, already selected, or held by current user
-    const isOwnHeld = ownHeldSeats.includes(seat.id);
-    if (seat.status === 'available' || selectedSeats.includes(seat.id) || isOwnHeld) {
+    if (seat.status === 'available' || selectedSeats.includes(seat.id)) {
       onSeatSelect(seat.id);
     }
-  };
-  
-  const isSeatDisabled = (seat: Seat) => {
-    // Never disable selected seats (user can unselect)
-    if (selectedSeats.includes(seat.id)) return false;
-    // Don't disable own held seats (user can unselect)
-    if (ownHeldSeats.includes(seat.id)) return false;
-    // Disable booked and held (by others) seats
-    return seat.status === 'booked' || seat.status === 'held';
   };
 
   return (
@@ -93,7 +77,7 @@ export function SeatMap({ seats, selectedSeats, onSeatSelect, ownHeldSeats = [] 
                   <button
                     key={seat.id}
                     onClick={() => handleSeatClick(seat)}
-                    disabled={isSeatDisabled(seat)}
+                    disabled={seat.status === 'booked' || seat.status === 'held'}
                     className={cn("seat", getSeatClass(seat))}
                     title={`Seat ${seat.row}${seat.column} - $${seat.price}`}
                     aria-label={`Seat ${seat.row}${seat.column}, ${seat.status}`}
@@ -114,7 +98,7 @@ export function SeatMap({ seats, selectedSeats, onSeatSelect, ownHeldSeats = [] 
                   <button
                     key={seat.id}
                     onClick={() => handleSeatClick(seat)}
-                    disabled={isSeatDisabled(seat)}
+                    disabled={seat.status === 'booked' || seat.status === 'held'}
                     className={cn("seat", getSeatClass(seat))}
                     title={`Seat ${seat.row}${seat.column} - $${seat.price}`}
                     aria-label={`Seat ${seat.row}${seat.column}, ${seat.status}`}
